@@ -33,9 +33,19 @@ pub struct SceneFile {
 pub struct SavedLink {
     pub from: usize,
     pub to: usize,
+    /// Pin positions in item content coordinates (image source pixels, or stroke-local);
+    /// absent in older boards, where links attach to item centers.
+    #[serde(default)]
+    pub from_at: Option<[f32; 2]>,
+    #[serde(default)]
+    pub to_at: Option<[f32; 2]>,
     pub color: [u8; 4],
     #[serde(default = "yes")]
     pub arrow: bool,
+}
+
+fn is_zero(v: &u8) -> bool {
+    *v == 0
 }
 
 fn yes() -> bool {
@@ -53,6 +63,9 @@ pub struct SavedItem {
     pub flip_y: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub title: String,
+    /// Local edge the title bar is on: 0 top, 1 right, 2 bottom, 3 left.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub title_edge: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tag: Option<[u8; 4]>,
     pub kind: SavedKind,
@@ -141,17 +154,27 @@ mod tests {
                 flip_x: false,
                 flip_y: false,
                 title: title.into(),
+                title_edge: 0,
                 tag: (!title.is_empty()).then_some([200, 80, 80, 255]),
                 kind: SavedKind::Unsupported,
             });
         }
-        scene.links.push(SavedLink { from: 0, to: 1, color: [255; 4], arrow: false });
+        scene.links.push(SavedLink {
+            from: 0,
+            to: 1,
+            from_at: Some([5.0, 6.0]),
+            to_at: None,
+            color: [255; 4],
+            arrow: false,
+        });
         let json = serde_json::to_string(&scene).unwrap();
         let back: SceneFile = serde_json::from_str(&json).unwrap();
         assert_eq!(back.items[0].title, "Suspect");
         assert_eq!(back.items[0].tag, Some([200, 80, 80, 255]));
         assert!(back.items[1].title.is_empty() && back.items[1].tag.is_none());
-        assert_eq!((back.links[0].from, back.links[0].to, back.links[0].arrow), (0, 1, false));
+        let l = &back.links[0];
+        assert_eq!((l.from, l.to, l.arrow), (0, 1, false));
+        assert_eq!((l.from_at, l.to_at), (Some([5.0, 6.0]), None));
 
         // Boards written before titles and links still load.
         let old = r#"{"version":1,"background":[0,0,0,255],"view":null,

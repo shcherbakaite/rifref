@@ -12,7 +12,7 @@ use eframe::egui::{
 };
 
 use crate::item::{
-    link_ends, polyline_distance, rotate, segment_distance, stroke_geometry, Content,
+    polyline_distance, rotate, segment_distance, stroke_geometry, Content,
     Frame as SelFrame, ImageAsset, Item, Link, StrokeData, FULL_CROP,
 };
 use crate::loader::{self, Decoded, Layout, LoadMsg};
@@ -65,6 +65,8 @@ const TAG_COLORS: [Color32; 8] = [
 /// Link line width and arrowhead length, in screen pixels.
 const LINK_PX: f32 = 2.0;
 const ARROW_PX: f32 = 11.0;
+/// Pin head radius, in screen pixels.
+const PIN_PX: f32 = 6.0;
 
 const BACKGROUNDS: [(&str, Color32); 4] = [
     ("Dark", Color32::from_rgb(34, 34, 36)),
@@ -149,9 +151,17 @@ enum Drag {
     Erase {
         changed: bool,
     },
-    /// Dragging a new link out of item `from`; `at` is the pointer (world).
+    /// Dragging a new link out of item `from`, pinned at `from_at` (content coordinates);
+    /// `at` is the pointer (world).
     Link {
         from: u64,
+        from_at: Pos2,
+        at: Pos2,
+    },
+    /// Moving one pin of link `link` (its `to` end if `to_end`); `at` is the pointer (world).
+    Pin {
+        link: usize,
+        to_end: bool,
         at: Pos2,
     },
 }
@@ -368,7 +378,7 @@ impl App {
         self.items.iter().find(|it| it.id == id)
     }
 
-    /// Endpoints of each drawable link (both items present and apart), by link index.
+    /// World positions of both pins of each link whose items exist, by link index.
     fn link_lines(&self) -> Vec<(usize, Pos2, Pos2)> {
         let by_id: HashMap<u64, &Item> = self.items.iter().map(|it| (it.id, it)).collect();
         self.links
@@ -376,9 +386,29 @@ impl App {
             .enumerate()
             .filter_map(|(i, l)| {
                 let (a, b) = (by_id.get(&l.from)?, by_id.get(&l.to)?);
-                link_ends(a, b).map(|(pa, pb)| (i, pa, pb))
+                Some((i, a.pin_world(l.from_at), b.pin_world(l.to_at)))
             })
             .collect()
+    }
+
+    /// The pin (link index, is its `to` end) under screen point `s`, topmost first.
+    fn hit_pin(&self, s: Pos2) -> Option<(usize, bool)> {
+        let r = PIN_PX + 3.0;
+        self.link_lines().into_iter().rev().find_map(|(i, a, b)| {
+            if self.w2s(b).distance(s) <= r {
+                Some((i, true))
+            } else if self.w2s(a).distance(s) <= r {
+                Some((i, false))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Where a pin dropped at `w` on item `idx` goes, in that item's content coordinates.
+    fn pin_spot(&self, idx: usize, w: Pos2) -> Pos2 {
+        let it = &self.items[idx];
+        it.clamp_content(it.world_to_content(w))
     }
 
     /// Topmost link passing near `w`.
@@ -736,6 +766,7 @@ impl App {
                 flip_x: it.flip_x,
                 flip_y: it.flip_y,
                 title: it.title.clone(),
+                title_edge: it.title_edge,
                 tag: it.tag.map(|c| c.to_array()),
                 kind,
             });
@@ -747,6 +778,8 @@ impl App {
                 Some(SavedLink {
                     from: *item_index.get(&l.from)?,
                     to: *item_index.get(&l.to)?,
+                    from_at: Some([l.from_at.x, l.from_at.y]),
+                    to_at: Some([l.to_at.x, l.to_at.y]),
                     color: l.color.to_array(),
                     arrow: l.arrow,
                 })
@@ -817,18 +850,31 @@ impl App {
             it.flip_y = s.flip_y;
             it.crop = crop_rect;
             it.title = s.title;
+            it.title_edge = s.title_edge % 4;
             it.tag = s.tag.map(color);
             *ids.last_mut().unwrap() = Some(id);
             self.items.push(it);
         }
         let id_at = |i: usize| ids.get(i).copied().flatten();
+        let items = &self.items;
+        // Older boards have no pin positions: pin to the item's center.
+        let spot = |id: u64, at: Option<[f32; 2]>| {
+            let it = items.iter().find(|it| it.id == id)?;
+            Some(match at {
+                Some([x, y]) => pos2(x, y),
+                None => it.world_to_content(it.center),
+            })
+        };
         self.links = scene
             .links
             .iter()
             .filter_map(|l| {
+                let (from, to) = (id_at(l.from)?, id_at(l.to)?);
                 Some(Link {
-                    from: id_at(l.from)?,
-                    to: id_at(l.to)?,
+                    from,
+                    to,
+                    from_at: spot(from, l.from_at)?,
+                    to_at: spot(to, l.to_at)?,
                     color: color(l.color),
                     arrow: l.arrow,
                     selected: false,
@@ -1132,9 +1178,13 @@ impl App {
         let Some(i) = self.items.iter().position(|it| it.id == edit.id) else {
             return;
         };
-        if self.items[i].title != text {
+        let it = &self.items[i];
+        if it.title != text {
+            // A new title goes on whichever edge is on top now; renaming keeps it in place.
+            let edge = if it.title.is_empty() { it.upward_edge() } else { it.title_edge };
             self.push_undo();
             self.items[i].title = text;
+            self.items[i].title_edge = edge;
         }
     }
 
@@ -1153,26 +1203,19 @@ impl App {
         }
     }
 
-    /// Connect two items; returns false if they already are (either direction).
-    fn add_link(&mut self, from: u64, to: u64) -> bool {
-        if from == to
-            || self
-                .links
-                .iter()
-                .any(|l| (l.from, l.to) == (from, to) || (l.from, l.to) == (to, from))
-        {
-            return false;
-        }
+    /// Connect a spot on one item to a spot on another (content coordinates).
+    fn add_link(&mut self, from: u64, from_at: Pos2, to: u64, to_at: Pos2) {
         self.push_undo();
         self.deselect_all();
         self.links.push(Link {
             from,
             to,
+            from_at,
+            to_at,
             color: self.pen_color,
             arrow: true,
             selected: true,
         });
-        true
     }
 
     fn reverse_links(&mut self) {
@@ -1833,15 +1876,22 @@ impl App {
                 self.drag = Drag::Erase { changed };
             }
             Tool::Link => {
-                if let Some(i) = self.hit_item(w) {
+                if let Some((link, to_end)) = self.hit_pin(origin) {
+                    self.drag = Drag::Pin { link, to_end, at: w };
+                } else if let Some(i) = self.hit_item(w) {
                     self.drag = Drag::Link {
                         from: self.items[i].id,
+                        from_at: self.pin_spot(i, w),
                         at: w,
                     };
                 }
             }
             Tool::Select => {
-                if let Some(h) = self.hit_handle(origin, mods) {
+                let handle = self.hit_handle(origin, mods);
+                let pin = self.hit_pin(origin);
+                if let (None, Some((link, to_end))) = (handle, pin) {
+                    self.drag = Drag::Pin { link, to_end, at: w };
+                } else if let Some(h) = handle {
                     let frame = self.selection_frame().expect("handle implies selection");
                     let corners = frame.corners();
                     self.push_undo();
@@ -1996,7 +2046,7 @@ impl App {
                 let now = self.erase_at(w, self.eraser_radius / zoom);
                 self.drag = Drag::Erase { changed: c || now };
             }
-            Drag::Link { at, .. } => *at = w,
+            Drag::Link { at, .. } | Drag::Pin { at, .. } => *at = w,
         }
     }
 
@@ -2012,12 +2062,32 @@ impl App {
             Drag::Erase { changed: false } => {
                 self.undo.pop();
             }
-            Drag::Link { from, at } => {
-                if let Some(i) = self.hit_item(at) {
-                    let to = self.items[i].id;
-                    if to != from && !self.add_link(from, to) {
-                        self.set_status(ctx, "Those two are already linked");
+            Drag::Link { from, from_at, at } => match self.hit_item(at) {
+                Some(i) if self.items[i].id != from => {
+                    let to_at = self.pin_spot(i, at);
+                    self.add_link(from, from_at, self.items[i].id, to_at);
+                }
+                Some(_) => self.set_status(ctx, "Drop the link on a different item"),
+                None => {}
+            },
+            Drag::Pin { link, to_end, at } => {
+                let Some(l) = self.links.get(link) else {
+                    return;
+                };
+                let other = if to_end { l.from } else { l.to };
+                match self.hit_item(at) {
+                    Some(i) if self.items[i].id != other => {
+                        let (id, spot) = (self.items[i].id, self.pin_spot(i, at));
+                        self.push_undo();
+                        let l = &mut self.links[link];
+                        if to_end {
+                            (l.to, l.to_at) = (id, spot);
+                        } else {
+                            (l.from, l.from_at) = (id, spot);
+                        }
                     }
+                    Some(_) => self.set_status(ctx, "Both ends of a link can't be on the same item"),
+                    None => self.set_status(ctx, "Drop a pin on an item to move it"),
                 }
             }
             _ => {}
@@ -2186,8 +2256,13 @@ impl App {
 
         // Cursor.
         if resp.hovered() {
-            let icon = if matches!(self.drag, Drag::Pan { .. }) {
+            let on_pin = self.tool != Tool::Pen
+                && self.tool != Tool::Eraser
+                && hover.is_some_and(|p| self.hit_pin(p).is_some());
+            let icon = if matches!(self.drag, Drag::Pan { .. } | Drag::Pin { .. }) {
                 CursorIcon::Grabbing
+            } else if on_pin && self.cropping.is_none() {
+                CursorIcon::Grab
             } else if space {
                 CursorIcon::Grab
             } else {
@@ -2317,52 +2392,60 @@ impl App {
             return;
         }
         let tag = it.tag.unwrap_or(TAG_COLORS[0]);
-        let card: Vec<Pos2> = it.card_corners().iter().map(|p| self.w2s(*p)).collect();
-        let tb = it.title_height();
-        if tb > 0.0 {
-            let h = it.half();
-            let to_screen = |x: f32, y: f32| self.w2s(it.center + rotate(vec2(x, y), it.rotation));
-            let bar = vec![
-                card[0],
-                card[1],
-                to_screen(h.x, -h.y),
-                to_screen(-h.x, -h.y),
-            ];
-            painter.add(Shape::convex_polygon(bar, tag, Stroke::NONE));
-            // Font sizes are stepped so zooming doesn't fill the font atlas with every size.
-            let size = tb * 0.6 * self.zoom;
-            let size = (2f32.powf((size.log2() * 6.0).round() / 6.0)).min(96.0);
-            if size >= 5.0 {
-                let lum = tag.r() as u32 * 3 + tag.g() as u32 * 6 + tag.b() as u32;
-                let ink = if lum > 1500 { Color32::BLACK } else { Color32::WHITE };
-                let pad = tb * 0.3;
-                let mut job = LayoutJob::single_section(
-                    it.title.clone(),
-                    TextFormat::simple(FontId::proportional(size), ink),
-                );
-                job.wrap = TextWrapping {
-                    max_width: ((h.x * 2.0 - pad * 2.0) * self.zoom).max(1.0),
-                    max_rows: 1,
-                    break_anywhere: true,
-                    overflow_character: Some('…'),
-                };
-                let galley = painter.layout_job(job);
-                let text_h = galley.size().y / self.zoom;
-                let top_left = to_screen(-h.x + pad, -h.y - tb + (tb - text_h) * 0.5);
-                painter.add(TextShape::new(top_left, galley, ink).with_angle(it.rotation));
-            }
+        let outline = Stroke::new(1.5, tag);
+        let image: Vec<Pos2> = it.corners().iter().map(|p| self.w2s(*p)).collect();
+        painter.add(Shape::closed_line(image, outline));
+        let Some(bar) = it.title_bar() else {
+            return;
+        };
+        let corners: Vec<Pos2> = bar.corners().iter().map(|p| self.w2s(*p)).collect();
+        painter.add(Shape::convex_polygon(corners, tag, outline));
+        // Font sizes are stepped so zooming doesn't fill the font atlas with every size.
+        let size = bar.height * 0.6 * self.zoom;
+        let size = (2f32.powf((size.log2() * 6.0).round() / 6.0)).min(96.0);
+        if size < 5.0 {
+            return;
         }
-        painter.add(Shape::closed_line(card, Stroke::new(1.5, tag)));
+        let lum = tag.r() as u32 * 3 + tag.g() as u32 * 6 + tag.b() as u32;
+        let ink = if lum > 1500 { Color32::BLACK } else { Color32::WHITE };
+        let pad = bar.height * 0.3;
+        let mut job = LayoutJob::single_section(
+            it.title.clone(),
+            TextFormat::simple(FontId::proportional(size), ink),
+        );
+        job.wrap = TextWrapping {
+            max_width: ((bar.length - pad * 2.0) * self.zoom).max(1.0),
+            max_rows: 1,
+            break_anywhere: true,
+            overflow_character: Some('…'),
+        };
+        let galley = painter.layout_job(job);
+        let text_h = galley.size().y / self.zoom;
+        let top_left = bar.origin + bar.along * pad - bar.up * ((bar.height - text_h) * 0.5);
+        painter.add(TextShape::new(self.w2s(top_left), galley, ink).with_angle(bar.along.angle()));
     }
 
     fn draw_links(&self, painter: &egui::Painter) {
+        let moving = match self.drag {
+            Drag::Pin { link, to_end, at } => Some((link, to_end, at)),
+            _ => None,
+        };
         for (i, a, b) in self.link_lines() {
             let l = &self.links[i];
-            let (a, b) = (self.w2s(a), self.w2s(b));
-            if l.selected {
-                draw_link(painter, a, b, l.arrow, LINK_PX + 4.0, ACCENT.gamma_multiply(0.6));
+            let (mut a, mut b) = (self.w2s(a), self.w2s(b));
+            // A pin being dragged follows the pointer.
+            match moving {
+                Some((m, true, at)) if m == i => b = self.w2s(at),
+                Some((m, false, at)) if m == i => a = self.w2s(at),
+                _ => {}
             }
-            draw_link(painter, a, b, l.arrow, LINK_PX, l.color);
+            if l.selected {
+                let halo = ACCENT.gamma_multiply(0.6);
+                draw_link(painter, a, b, l.arrow, false, LINK_PX + 4.0, halo);
+                painter.circle_filled(a, PIN_PX + 3.0, halo);
+                painter.circle_filled(b, PIN_PX + 3.0, halo);
+            }
+            draw_link(painter, a, b, l.arrow, true, LINK_PX, l.color);
         }
     }
 
@@ -2465,20 +2548,19 @@ impl App {
                     painter.rect_stroke(r, 0.0, Stroke::new(1.0, ACCENT), StrokeKind::Inside);
                 }
             }
-            Drag::Link { from, at } => {
-                // Rubber-band line from the source card to the pointer, or to the target's edge.
+            Drag::Link { from, from_at, at } => {
+                // String from the first pin to the pointer, with a pin where it would land.
                 if let Some(src) = self.item_by_id(*from) {
-                    let target = self.hit_item(*at).map(|i| &self.items[i]).filter(|t| t.id != *from);
-                    let ends = match target {
-                        Some(t) => {
-                            let c: Vec<Pos2> = t.card_corners().iter().map(|p| self.w2s(*p)).collect();
+                    let a = self.w2s(src.pin_world(*from_at));
+                    match self.hit_item(*at).filter(|&i| self.items[i].id != *from) {
+                        Some(i) => {
+                            let t = &self.items[i];
+                            let c: Vec<Pos2> = t.corners().iter().map(|p| self.w2s(*p)).collect();
                             painter.add(Shape::closed_line(c, Stroke::new(2.0, ACCENT)));
-                            link_ends(src, t)
+                            let b = self.w2s(t.pin_world(self.pin_spot(i, *at)));
+                            draw_link(painter, a, b, true, true, LINK_PX, self.pen_color);
                         }
-                        None => src.edge_toward(*at).map(|e| (e, *at)),
-                    };
-                    if let Some((a, b)) = ends {
-                        draw_link(painter, self.w2s(a), self.w2s(b), true, LINK_PX, self.pen_color);
+                        None => draw_link(painter, a, self.w2s(*at), true, false, LINK_PX, self.pen_color),
                     }
                 }
             }
@@ -2860,11 +2942,13 @@ impl App {
             self.title_edit = None;
             return;
         };
-        let h = it.half();
-        let tb = it.title_bar_height();
-        let top_left = self.w2s(it.center + rotate(vec2(-h.x, -h.y - tb), it.rotation));
-        let width = (h.x * 2.0 * self.zoom).clamp(160.0, 520.0);
-        let font = (tb * 0.6 * self.zoom).clamp(13.0, 28.0);
+        // Over the bar, or where it will appear: the edge that is on top right now.
+        let edge = if it.title.is_empty() { it.upward_edge() } else { it.title_edge };
+        let bar = it.title_bar_on(edge);
+        let r = Rect::from_points(&bar.corners());
+        let top_left = self.w2s(r.min);
+        let width = (bar.length * self.zoom).clamp(160.0, 520.0);
+        let font = (bar.height * 0.6 * self.zoom).clamp(13.0, 28.0);
         let edit = self.title_edit.as_mut().unwrap();
         // Some(true): apply, Some(false): cancel.
         let mut done = None;
@@ -2914,7 +2998,8 @@ impl App {
             ("Always on top", "Ctrl+Shift+T"),
             ("Grid", "G show · N / Shift+N spacing · hold Shift while dragging to snap"),
             ("Title an image", "T or F2, or double-click its title bar · right-click → Label colour"),
-            ("Link items", "L, then drag from one item to another · click a link to select it, Del removes"),
+            ("Link items", "L, then drag from a spot on one item to a spot on another"),
+            ("Move a pin", "Drag a link's pin to another spot, or onto another item · Del removes a selected link"),
             ("Snap while moving", "Shift: a stroke's points (or an image's corner) land on the grid"),
             ("Toolbar", "Tab"),
         ];
@@ -3073,22 +3158,45 @@ fn draw_polyline(painter: &egui::Painter, pts: Vec<Pos2>, width: f32, color: Col
     }
 }
 
-/// A link line from `a` to `b` (screen), with an optional arrowhead at `b`.
-fn draw_link(painter: &egui::Painter, a: Pos2, b: Pos2, arrow: bool, width: f32, color: Color32) {
+/// A link from pin `a` to pin `b` (screen): the string, an optional arrowhead stopping at `b`'s
+/// pin head, and (with `pin_b`) a pin head at `b`. `a` always gets a pin head.
+fn draw_link(
+    painter: &egui::Painter,
+    a: Pos2,
+    b: Pos2,
+    arrow: bool,
+    pin_b: bool,
+    width: f32,
+    color: Color32,
+) {
     let d = b - a;
     let len = d.length();
-    if len < 1.0 {
-        return;
+    if len > 1.0 {
+        let dir = d / len;
+        // The arrow points at the pin head's rim, not under it.
+        let tip = if pin_b { b - dir * PIN_PX } else { b };
+        let head = (ARROW_PX + width * 0.5).min(len * 0.4);
+        if arrow && len > PIN_PX * 2.0 + head {
+            let back = tip - dir * head;
+            painter.line_segment([a, tip - dir * head * 0.8], Stroke::new(width, color));
+            let side = dir.rot90() * head * 0.45;
+            painter.add(Shape::convex_polygon(vec![tip, back + side, back - side], color, Stroke::NONE));
+        } else {
+            painter.line_segment([a, b], Stroke::new(width, color));
+        }
     }
-    let dir = d / len;
-    let head = (ARROW_PX + width * 0.5).min(len * 0.5);
-    let end = if arrow { b - dir * head * 0.8 } else { b };
-    painter.line_segment([a, end], Stroke::new(width, color));
-    if arrow {
-        let side = dir.rot90() * head * 0.45;
-        let back = b - dir * head;
-        painter.add(Shape::convex_polygon(vec![b, back + side, back - side], color, Stroke::NONE));
+    draw_pin(painter, a, color);
+    if pin_b {
+        draw_pin(painter, b, color);
     }
+}
+
+/// A push-pin head: a coloured disc with a dark rim and a highlight.
+fn draw_pin(painter: &egui::Painter, p: Pos2, color: Color32) {
+    painter.circle_filled(p + vec2(1.0, 1.5), PIN_PX, Color32::from_black_alpha(90));
+    painter.circle_filled(p, PIN_PX, color);
+    painter.circle_stroke(p, PIN_PX, Stroke::new(1.0, Color32::from_black_alpha(150)));
+    painter.circle_filled(p + vec2(-PIN_PX * 0.3, -PIN_PX * 0.3), PIN_PX * 0.3, Color32::from_white_alpha(170));
 }
 
 fn swatch(ui: &mut egui::Ui, c: Color32, selected: bool) -> egui::Response {

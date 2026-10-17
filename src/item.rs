@@ -48,13 +48,48 @@ pub struct Item {
     pub title: String,
     /// Label colour of the title bar and card border (investigation-board style grouping).
     pub tag: Option<Color32>,
+    /// Which edge of the item the title bar is attached to, in local coordinates (see
+    /// `EDGE_NORMALS`). Chosen when the title is first set: the edge that was on top then.
+    pub title_edge: u8,
 }
 
-/// A connection between two items (by id), drawn as a line between their edges.
+/// Outward normals of the local edges: top, right, bottom, left.
+const EDGE_NORMALS: [Vec2; 4] = [vec2(0.0, -1.0), vec2(1.0, 0.0), vec2(0.0, 1.0), vec2(-1.0, 0.0)];
+
+/// A title bar in world space. `origin` is the outer corner where the text starts; the text runs
+/// along `along` and its "up" is `up`, which points away from the item.
+#[derive(Clone, Copy, Debug)]
+pub struct TitleBar {
+    pub origin: Pos2,
+    pub along: Vec2,
+    pub up: Vec2,
+    pub length: f32,
+    pub height: f32,
+}
+
+impl TitleBar {
+    /// Outer edge first (where the text starts, where it ends), then the inner edge.
+    pub fn corners(&self) -> [Pos2; 4] {
+        let end = self.along * self.length;
+        let inner = -self.up * self.height;
+        [self.origin, self.origin + end, self.origin + end + inner, self.origin + inner]
+    }
+
+    pub fn contains(&self, w: Pos2) -> bool {
+        let r = w - self.origin;
+        let (a, u) = (r.dot(self.along), r.dot(self.up));
+        (0.0..=self.length).contains(&a) && (-self.height..=0.0).contains(&u)
+    }
+}
+
+/// A connection between two items (by id): a line between two pins stuck to the items.
 #[derive(Clone)]
 pub struct Link {
     pub from: u64,
     pub to: u64,
+    /// Pin positions in each item's content coordinates (see `Item::world_to_content`).
+    pub from_at: Pos2,
+    pub to_at: Pos2,
     pub color: Color32,
     /// Draw an arrowhead at the `to` end.
     pub arrow: bool,
@@ -85,7 +120,50 @@ impl Item {
             crop: FULL_CROP,
             title: String::new(),
             tag: None,
+            title_edge: 0,
         }
+    }
+
+    /// World direction of a local direction (applies flips and rotation, not scale).
+    fn local_dir_to_world(&self, d: Vec2) -> Vec2 {
+        let d = vec2(
+            if self.flip_x { -d.x } else { d.x },
+            if self.flip_y { -d.y } else { d.y },
+        );
+        rotate(d, self.rotation)
+    }
+
+    /// The local edge that currently faces up on the board.
+    pub fn upward_edge(&self) -> u8 {
+        (0..4u8)
+            .max_by(|&a, &b| {
+                let up = |e: u8| -self.local_dir_to_world(EDGE_NORMALS[e as usize]).y;
+                up(a).total_cmp(&up(b))
+            })
+            .unwrap()
+    }
+
+    /// The title bar on local edge `edge`, whether or not the item has a title.
+    pub fn title_bar_on(&self, edge: u8) -> TitleBar {
+        let n_local = EDGE_NORMALS[edge as usize % 4];
+        let h = self.half();
+        let (depth, length) = if n_local.x == 0.0 { (h.y, h.x * 2.0) } else { (h.x, h.y * 2.0) };
+        let height = self.title_bar_height();
+        let up = self.local_dir_to_world(n_local);
+        // Text reads left to right when `up` points up the screen, and is never mirrored.
+        let along = vec2(-up.y, up.x);
+        TitleBar {
+            origin: self.center + up * (depth + height) - along * (length * 0.5),
+            along,
+            up,
+            length,
+            height,
+        }
+    }
+
+    /// The title bar, if the item has a title.
+    pub fn title_bar(&self) -> Option<TitleBar> {
+        (!self.title.is_empty()).then(|| self.title_bar_on(self.title_edge))
     }
 
     /// Height (world units) the title bar has, or would have once a title is set.
@@ -94,52 +172,38 @@ impl Item {
         ((s.x * s.y).abs().sqrt() * TITLE_FRAC).max(MIN_TITLE)
     }
 
-    /// Height of the title bar above the item; 0 without a title.
-    pub fn title_height(&self) -> f32 {
-        if self.title.is_empty() {
-            0.0
-        } else {
-            self.title_bar_height()
+    /// Whether `w` lies on the title bar.
+    pub fn hit_title(&self, w: Pos2) -> bool {
+        self.title_bar().is_some_and(|b| b.contains(w))
+    }
+
+    /// A world point in content coordinates: source pixels for images (so it stays on the same
+    /// spot of the picture through cropping), local unscaled coordinates for strokes.
+    pub fn world_to_content(&self, w: Pos2) -> Pos2 {
+        match &self.content {
+            Content::Image(a) => self.world_to_px(a.size, w),
+            Content::Stroke(_) => self.world_to_local(w).to_pos2(),
         }
     }
 
-    /// `w` in the item's rotated (but unscaled, unflipped) frame, relative to the center.
-    fn rotated_offset(&self, w: Pos2) -> Vec2 {
-        rotate(w - self.center, -self.rotation)
+    pub fn content_to_world(&self, p: Pos2) -> Pos2 {
+        match &self.content {
+            Content::Image(a) => self.px_to_world(a.size, p),
+            Content::Stroke(_) => self.local_to_world(p.to_vec2()),
+        }
     }
 
-    /// Whether `w` lies on the title bar.
-    pub fn hit_title(&self, w: Pos2) -> bool {
-        let tb = self.title_height();
-        let l = self.rotated_offset(w);
-        let h = self.half();
-        tb > 0.0 && l.x.abs() <= h.x && l.y < -h.y && l.y >= -h.y - tb
+    /// The nearest content point that is visible (inside the crop / the stroke's box).
+    pub fn clamp_content(&self, p: Pos2) -> Pos2 {
+        match &self.content {
+            Content::Image(a) => self.crop_px(a.size).clamp(p),
+            Content::Stroke(_) => Rect::from_center_size(Pos2::ZERO, self.size).clamp(p),
+        }
     }
 
-    /// World-space corners of the item including its title bar (TL, TR, BR, BL).
-    pub fn card_corners(&self) -> [Pos2; 4] {
-        let h = self.half();
-        let top = -h.y - self.title_height();
-        [(-h.x, top), (h.x, top), (h.x, h.y), (-h.x, h.y)]
-            .map(|(x, y)| self.center + rotate(vec2(x, y), self.rotation))
-    }
-
-    /// Where the line from the center towards `target` leaves the card (item plus title bar).
-    /// `None` when `target` is inside the card.
-    pub fn edge_toward(&self, target: Pos2) -> Option<Pos2> {
-        let d = target - self.center;
-        let l = rotate(d, -self.rotation);
-        let h = self.half();
-        let tx = if l.x != 0.0 { h.x / l.x.abs() } else { f32::INFINITY };
-        let ty = if l.y < 0.0 {
-            (h.y + self.title_height()) / -l.y
-        } else if l.y > 0.0 {
-            h.y / l.y
-        } else {
-            f32::INFINITY
-        };
-        let t = tx.min(ty);
-        (t < 1.0).then(|| self.center + d * t)
+    /// Where a pin at content point `p` sits on the board; kept on the visible part of the item.
+    pub fn pin_world(&self, p: Pos2) -> Pos2 {
+        self.content_to_world(self.clamp_content(p))
     }
 
     pub fn is_stroke(&self) -> bool {
@@ -213,7 +277,11 @@ impl Item {
 
     /// Bounds including the title bar.
     pub fn world_aabb(&self) -> Rect {
-        Rect::from_points(&self.card_corners())
+        let r = Rect::from_points(&self.corners());
+        match self.title_bar() {
+            Some(b) => r.union(Rect::from_points(&b.corners())),
+            None => r,
+        }
     }
 
     /// Hit test in world space. `tol` is a world-space tolerance used for thin strokes.
@@ -256,13 +324,6 @@ pub fn polyline_distance(points: &[Pos2], p: Pos2) -> f32 {
             .map(|w| segment_distance(p, w[0], w[1]))
             .fold(f32::INFINITY, f32::min),
     }
-}
-
-/// Endpoints of a link line from `a` to `b`, clipped to both cards. `None` when they overlap.
-pub fn link_ends(a: &Item, b: &Item) -> Option<(Pos2, Pos2)> {
-    let pa = a.edge_toward(b.center)?;
-    let pb = b.edge_toward(a.center)?;
-    ((pb - pa).dot(b.center - a.center) > 0.0).then_some((pa, pb))
 }
 
 /// Build a stroke item from world-space points. Returns `(center, size, local_points)`.
@@ -339,30 +400,65 @@ mod tests {
         assert!(!it.hit(above, 0.0));
         let plain = it.world_aabb();
         it.title = "Suspect".into();
-        let tb = it.title_height();
+        let tb = it.title_bar_height();
         assert!(tb >= MIN_TITLE);
         assert!(it.hit_title(above) && it.hit(above, 0.0));
         assert!(!it.hit_title(pos2(0.0, 0.0)));
-        assert_eq!(it.world_aabb().min.y, plain.min.y - tb);
-        assert_eq!(it.world_aabb().max, plain.max);
+        assert!((it.world_aabb().min.y - (plain.min.y - tb)).abs() < 1e-3);
+        assert!(it.world_aabb().max.distance(plain.max) < 1e-3);
     }
 
     #[test]
-    fn links_end_at_card_edges() {
-        let content = image_item().content;
-        let a = Item::new(1, content.clone(), pos2(0.0, 0.0), vec2(100.0, 100.0));
-        let mut b = Item::new(2, content, pos2(300.0, 0.0), vec2(100.0, 100.0));
-        let (pa, pb) = link_ends(&a, &b).unwrap();
-        assert!(pa.distance(pos2(50.0, 0.0)) < 1e-3);
-        assert!(pb.distance(pos2(250.0, 0.0)) < 1e-3);
-        // Vertically, a title bar on the lower card moves the end up to the top of the bar.
-        b.center = pos2(0.0, 300.0);
-        b.title = "x".into();
-        let (_, pb) = link_ends(&a, &b).unwrap();
-        assert!((pb.y - (250.0 - b.title_height())).abs() < 1e-3);
-        // Overlapping cards have no line.
-        b.center = pos2(20.0, 20.0);
-        assert!(link_ends(&a, &b).is_none());
+    fn title_goes_on_the_edge_that_was_on_top_and_stays_there() {
+        let mut it = Item::new(1, image_item().content, pos2(0.0, 0.0), vec2(200.0, 100.0));
+        let quarter = std::f32::consts::FRAC_PI_2;
+        // Rotated a quarter turn clockwise, the local left edge faces up.
+        it.rotation = quarter;
+        it.title_edge = it.upward_edge();
+        assert_eq!(it.title_edge, 3);
+        it.title = "x".into();
+        let bar = it.title_bar().unwrap();
+        // Upright, readable text along the top of the rotated image (now 100 wide, 200 tall).
+        assert!((bar.up - vec2(0.0, -1.0)).length() < 1e-5);
+        assert!((bar.along - vec2(1.0, 0.0)).length() < 1e-5);
+        assert!(bar.origin.distance(pos2(-50.0, -100.0 - bar.height)) < 1e-3);
+        assert!((bar.length - 100.0).abs() < 1e-3);
+        // Rotating back carries the bar to the image's left side, reading bottom to top.
+        it.rotation = 0.0;
+        let bar = it.title_bar().unwrap();
+        assert!((bar.up - vec2(-1.0, 0.0)).length() < 1e-5);
+        assert!((bar.along - vec2(0.0, -1.0)).length() < 1e-5);
+        // A horizontal flip moves it to the right side, with the text still not mirrored.
+        it.flip_x = true;
+        let bar = it.title_bar().unwrap();
+        assert!((bar.up - vec2(1.0, 0.0)).length() < 1e-5);
+        assert!((bar.along - vec2(0.0, 1.0)).length() < 1e-5);
+        assert!(it.hit_title(pos2(100.0 + bar.height * 0.5, 0.0)));
+    }
+
+    #[test]
+    fn pins_stay_on_the_same_spot_of_the_picture() {
+        let ctx = eframe::egui::Context::default();
+        let texture = ctx.load_texture(
+            "t",
+            eframe::egui::ColorImage::filled([4, 2], Color32::WHITE),
+            Default::default(),
+        );
+        let full = vec2(400.0, 200.0);
+        let asset = Arc::new(ImageAsset { bytes: Arc::new(vec![]), texture, size: full });
+        let mut it = Item::new(1, Content::Image(asset), pos2(100.0, 50.0), full);
+        it.scale = 0.5;
+        it.rotation = 0.4;
+        it.flip_y = true;
+        let spot = pos2(300.0, 40.0); // source pixel
+        let w = it.content_to_world(spot);
+        assert!(it.world_to_content(w).distance(spot) < 1e-3);
+        // Cropping (edges pinned to the board) leaves the pin on the same world spot.
+        let orig = it.clone();
+        it.set_crop_px(&orig, full, Rect::from_min_max(pos2(200.0, 0.0), pos2(400.0, 100.0)), true);
+        assert!(it.pin_world(spot).distance(w) < 1e-3);
+        // A pin on a cropped-away part is shown on the nearest visible edge.
+        assert!((it.clamp_content(pos2(50.0, 40.0)) - pos2(200.0, 40.0)).length() < 1e-3);
     }
 
     #[test]

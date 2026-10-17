@@ -4,7 +4,7 @@ A reference board in the spirit of [PureRef](https://www.pureref.com/), written 
 [egui](https://github.com/emilk/egui). Drop images and PDF pages onto an infinite canvas, arrange
 them, sketch over them, and connect them with titled cards and links like an investigation board.
 
-![A RifRef board with titled, colour-labelled cards, links between them, pen annotations and a grid-snapped sketch](docs/screenshots/board.png)
+![A RifRef board with titled, colour-labelled cards, pinned links between spots on them, pen annotations and a grid-snapped sketch](docs/screenshots/board.png)
 
 ## Features
 
@@ -28,10 +28,14 @@ them, sketch over them, and connect them with titled cards and links like an inv
   - Stroke width is in board pixels, so strokes stay in proportion to the images at any zoom.
   - The eraser splits strokes where it passes.
 - **Titles and labels.** Give an image a caption bar (T, F2, or double-click the bar) and a label
-  colour to group related cards.
-- **Links.** With the Link tool (L), drag from one item to another to connect them. Links run from
-  edge to edge, have optional arrowheads, follow items as they move, and can be recoloured,
-  reversed or deleted.
+  colour to group related cards. The bar goes on whichever edge is on top when you first add the
+  title, then stays on that edge through rotation and flips, with the text never mirrored.
+- **Pinned links.** With the Link tool (L), drag from a spot on one item to a spot on another to
+  stretch a string between two pins.
+  - Pins stick to that spot of the picture through moving, scaling, rotating, flipping and
+    cropping.
+  - Drag a pin to re-pin it somewhere else, including onto a different item.
+  - Links can have an arrowhead, and can be recoloured, reversed or deleted.
 - **Grid and snapping, KiCad style.**
   - The dot grid's spacing is adjustable from presets (2–500 px) or a custom value; N / Shift+N
     step through the presets.
@@ -77,7 +81,8 @@ Press **F1** in the app to see the same list.
 | Fit all / selection | F, or double-click empty space |
 | Select tool | S or V |
 | Pen / Eraser | B / E (`[` and `]` change the size) |
-| Link tool | L, then drag from one item to another |
+| Link tool | L, then drag from a spot on one item to a spot on another |
+| Move a pin | Drag it to another spot or onto another item |
 | Select | Click, Shift+click, or drag a box |
 | Scale | Drag a corner handle |
 | Rotate | Drag just outside a corner (Shift snaps to 15°) |
@@ -105,7 +110,8 @@ A `.rifref` board is a JSON file with the following contents:
 - every image, stored once as base64 in its original encoded format (crops don't re-encode it);
 - the items, which are images or strokes, each with its position, scale, rotation, flips, crop,
   title and label colour;
-- the links, which refer to items by their index.
+- the links, which refer to items by their index and store each pin's position (in source pixels
+  for images, so crops don't move it).
 
 Fields added in newer versions are optional, so older boards keep opening, including `.refb`
 files from before the rename.
