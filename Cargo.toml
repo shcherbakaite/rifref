@@ -2,7 +2,7 @@
 name = "rifref"
 version = "0.1.0"
 edition = "2021"
-description = "An infinite-canvas reference board for images, notes and sketches (PureRef-like)"
+description = "A PureRef-like reference board: images, PDF pages, sketches and investigation-board links on an infinite canvas"
 
 [dependencies]
 eframe = { version = "0.33", features = ["persistence"] }
