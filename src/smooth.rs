@@ -18,6 +18,243 @@ const CORNER_COS: f32 = 0.35; // ≈70°
 /// Arc length (screen pixels) used to judge direction for corners and end tangents.
 const WINDOW_PX: f32 = 10.0;
 
+/// Finish a stroke whose samples are partly grid-snapped (`snapped[i]`). Freehand runs are
+/// smoothed with `finish_stroke`; snapped runs stay straight segments between grid points, with
+/// points along straight runs merged.
+pub fn finish_mixed(points: &[Pos2], snapped: &[bool], strength: f32, px: f32) -> Vec<Pos2> {
+    let mut out: Vec<Pos2> = Vec::with_capacity(points.len());
+    let mut i = 0;
+    while i < points.len() {
+        let mode = snapped.get(i).copied().unwrap_or(false);
+        let mut j = i;
+        while j < points.len() && snapped.get(j).copied().unwrap_or(false) == mode {
+            j += 1;
+        }
+        let run = &points[i..j];
+        let piece = if mode {
+            merge_collinear(run)
+        } else {
+            finish_stroke(run, strength, px)
+        };
+        out.extend(piece);
+        i = j;
+    }
+    out
+}
+
+/// The 8 directions a grid-snapped pen segment may take, as grid steps (y down).
+const DIRS: [(i32, i32); 8] = [(1, 0), (1, 1), (0, 1), (-1, 1), (-1, 0), (-1, -1), (0, -1), (1, -1)];
+
+/// State of grid-snapped (Shift) pen drawing, KiCad style: segments run at multiples of 45°
+/// and end on grid points.
+///
+/// - Near its start, the segment being drawn swings freely to whichever direction points at the
+///   pointer, so a wrong start can be corrected by steering.
+/// - Further out it grows along its line; leaving the line makes a corner at the grid point from
+///   which the next segment best reaches the pointer.
+/// - Moving back over the previous segment removes the last corner and makes that segment live
+///   again, so corners can be undone by retracing.
+#[derive(Default, Clone, Copy)]
+pub struct GridPen {
+    /// The last point is the live end of the current segment (it follows the pointer).
+    live: bool,
+    dir: Option<(i32, i32)>,
+    /// A corner made by turning that may still slide along the previous segment while the pointer
+    /// is near it.
+    pending: Option<PendingCorner>,
+}
+
+#[derive(Clone, Copy)]
+struct PendingCorner {
+    /// Start and direction of the segment the corner sits on.
+    from: Pos2,
+    dir: (i32, i32),
+    /// Position along that segment (in grid steps) where the pointer left it.
+    t: f32,
+}
+
+fn dir_vec(d: (i32, i32)) -> Vec2 {
+    Vec2::new(d.0 as f32, d.1 as f32)
+}
+
+/// Nearest 45° direction from `anchor` towards `w`, and the segment end a whole number of grid
+/// steps along it (`None` while the pointer is within half a step of the anchor).
+fn constrain_45(anchor: Pos2, w: Pos2, grid: f32) -> Option<((i32, i32), Pos2)> {
+    let v = w - anchor;
+    if v.length_sq() < 1e-12 {
+        return None;
+    }
+    let k = (v.y.atan2(v.x) / std::f32::consts::FRAC_PI_4).round() as i32;
+    let d = DIRS[k.rem_euclid(8) as usize];
+    let step = dir_vec(d) * grid;
+    let n = (v.dot(step) / step.length_sq()).round();
+    (n >= 1.0).then(|| (d, anchor + step * n))
+}
+
+/// How far `w` is from the best 45° line out of `c`.
+fn deviation_45(c: Pos2, w: Pos2, grid: f32) -> f32 {
+    let v = w - c;
+    match constrain_45(c, w, grid) {
+        Some((d, _)) => {
+            let u = dir_vec(d).normalized();
+            (v - u * v.dot(u)).length()
+        }
+        None => v.length(),
+    }
+}
+
+impl GridPen {
+    /// A freehand sample was added: the snapped segment (if any) is finished as it is.
+    pub fn release(&mut self) {
+        *self = Self::default();
+    }
+
+    fn set_live(&mut self, points: &mut Vec<Pos2>, snapped: &mut Vec<bool>, seg: Option<((i32, i32), Pos2)>) {
+        if self.live {
+            points.pop();
+            snapped.pop();
+        }
+        match seg {
+            Some((d, end)) => {
+                points.push(end);
+                snapped.push(true);
+                self.live = true;
+                self.dir = Some(d);
+            }
+            None => {
+                self.live = false;
+                self.dir = None;
+            }
+        }
+    }
+
+    /// Best corner position (grid steps along `p`) for reaching `w` with a 45° segment.
+    fn best_corner(p: &PendingCorner, w: Pos2, grid: f32) -> Pos2 {
+        let step = dir_vec(p.dir) * grid;
+        let lo = (p.t.floor() - 1.0).max(1.0) as i32;
+        let hi = (p.t.ceil() + 1.0).max(1.0) as i32;
+        // How well the next segment can reach the pointer, plus a penalty for putting the corner
+        // away from where the pointer actually left the line (which would overshoot the turn).
+        let cost = |k: i32| {
+            deviation_45(p.from + step * k as f32, w, grid) + 0.5 * (k as f32 - p.t).abs() * step.length()
+        };
+        let k = (lo..=hi)
+            .min_by(|&x, &y| cost(x).total_cmp(&cost(y)).then(x.cmp(&y)))
+            .unwrap_or(1);
+        p.from + step * k as f32
+    }
+
+    /// Add a Shift-held sample at `w`. `tolerance` (world units) is how far the pointer may stray
+    /// from a segment's line before that counts as turning.
+    pub fn add(
+        &mut self,
+        points: &mut Vec<Pos2>,
+        snapped: &mut Vec<bool>,
+        w: Pos2,
+        grid: f32,
+        tolerance: f32,
+    ) {
+        let on_grid = |p: Pos2| Pos2::new((p.x / grid).round() * grid, (p.y / grid).round() * grid);
+        // Entering snap mode: start from the nearest grid point.
+        if !snapped.last().copied().unwrap_or(false) {
+            points.push(on_grid(w));
+            snapped.push(true);
+            *self = Self::default();
+            return;
+        }
+        let swing_radius = 1.5 * grid.max(tolerance);
+
+        // Retracing the previous segment removes the corner at its end.
+        let a = points.len() - 1 - self.live as usize;
+        if a >= 1 && snapped[a - 1] {
+            let (prev, corner) = (points[a - 1], points[a]);
+            if w.distance(corner) > swing_radius
+                && crate::item::segment_distance(w, prev, corner) <= tolerance
+            {
+                if self.live {
+                    points.pop();
+                    snapped.pop();
+                }
+                points.pop();
+                snapped.pop();
+                *self = Self::default();
+                let seg = constrain_45(prev, w, grid);
+                self.set_live(points, snapped, seg);
+                return;
+            }
+        }
+
+        // A fresh corner keeps sliding along the previous segment while the pointer is near it,
+        // so it ends up where the turn really happened.
+        if let Some(p) = self.pending {
+            if w.distance(points[a]) <= swing_radius {
+                let corner = Self::best_corner(&p, w, grid);
+                points[a] = corner;
+                let seg = constrain_45(corner, w, grid);
+                self.set_live(points, snapped, seg);
+                return;
+            }
+            self.pending = None;
+        }
+
+        let anchor = points[a];
+        let (true, Some(d)) = (self.live, self.dir) else {
+            let seg = constrain_45(anchor, w, grid);
+            self.set_live(points, snapped, seg);
+            return;
+        };
+        if w.distance(anchor) <= swing_radius {
+            // Close to the corner: the segment swings to follow the pointer.
+            let seg = constrain_45(anchor, w, grid);
+            self.set_live(points, snapped, seg);
+            return;
+        }
+        let step = dir_vec(d) * grid;
+        let t = (w - anchor).dot(step) / step.length_sq();
+        let off_line = (w - (anchor + step * t)).length();
+        if off_line <= tolerance {
+            // Still following this segment: slide its end along the line.
+            let n = t.round();
+            let seg = (n >= 1.0).then(|| (d, anchor + step * n));
+            self.set_live(points, snapped, seg);
+            return;
+        }
+        // Turning: make a corner near where the pointer left the line. It stays adjustable
+        // (see `pending` above) until the pointer has clearly moved on.
+        let p = PendingCorner {
+            from: anchor,
+            dir: d,
+            t,
+        };
+        let corner = Self::best_corner(&p, w, grid);
+        *points.last_mut().unwrap() = corner;
+        *self = Self {
+            pending: Some(p),
+            ..Self::default()
+        };
+        let seg = constrain_45(corner, w, grid);
+        self.set_live(points, snapped, seg);
+    }
+}
+
+/// Drop points that lie on a straight line between their neighbours (same direction).
+fn merge_collinear(points: &[Pos2]) -> Vec<Pos2> {
+    let mut out: Vec<Pos2> = Vec::with_capacity(points.len());
+    for &p in points {
+        if out.len() >= 2 {
+            let (a, b) = (out[out.len() - 2], out[out.len() - 1]);
+            let (d1, d2) = (b - a, p - b);
+            let cross = d1.x * d2.y - d1.y * d2.x;
+            if cross.abs() <= 1e-4 * d1.length() * d2.length() && d1.dot(d2) > 0.0 {
+                *out.last_mut().unwrap() = p;
+                continue;
+            }
+        }
+        out.push(p);
+    }
+    out
+}
+
 /// Spacing of generated points, in screen pixels.
 const STEP_PX: f32 = 1.5;
 
@@ -538,6 +775,122 @@ mod tests {
             .map(|p| p.distance(pos2(100.0, 0.0)))
             .fold(f32::INFINITY, f32::min);
         assert!(closest < 1.5, "corner rounded off by {closest}");
+    }
+
+    #[test]
+    fn snapped_runs_stay_straight_and_freehand_runs_are_smoothed() {
+        // Grid points along an "L" (with a redundant point mid-way on each leg), then freehand.
+        let grid = vec![
+            pos2(0.0, 0.0),
+            pos2(50.0, 0.0),
+            pos2(100.0, 0.0),
+            pos2(100.0, 50.0),
+            pos2(100.0, 100.0),
+        ];
+        let free: Vec<Pos2> = (1..=6).map(|i| pos2(100.0 + 20.0 * i as f32, 100.0 + (i % 2) as f32 * 15.0)).collect();
+        let points: Vec<Pos2> = grid.iter().chain(&free).copied().collect();
+        let snapped: Vec<bool> = (0..points.len()).map(|i| i < grid.len()).collect();
+        let out = finish_mixed(&points, &snapped, 0.5, 1.0);
+        // The snapped part becomes exactly the three corner points of the "L".
+        assert_eq!(&out[..3], &[pos2(0.0, 0.0), pos2(100.0, 0.0), pos2(100.0, 100.0)]);
+        // The freehand part is densified into a curve.
+        assert!(out.len() > 3 + free.len());
+        assert_eq!(*out.last().unwrap(), *free.last().unwrap());
+    }
+
+    /// Feed pointer samples through `GridPen` with Shift held.
+    fn draw_snapped(samples: &[Pos2], grid: f32) -> Vec<Pos2> {
+        let (mut points, mut snapped, mut pen) = (Vec::new(), Vec::new(), GridPen::default());
+        for &w in samples {
+            pen.add(&mut points, &mut snapped, w, grid, grid * 0.5);
+        }
+        finish_mixed(&points, &snapped, 0.5, 1.0)
+    }
+
+    #[test]
+    fn grid_pen_draws_45_degree_segments() {
+        // Wobbly diagonal down-right to ~(100,100), then wobbly horizontal to ~(200,100).
+        let mut seed = 11;
+        let mut samples: Vec<Pos2> = (0..=50)
+            .map(|i| pos2(i as f32 * 2.0 + noise(&mut seed) * 3.0, i as f32 * 2.0 + noise(&mut seed) * 3.0))
+            .collect();
+        samples.extend((1..=50).map(|i| pos2(100.0 + i as f32 * 2.0, 100.0 + noise(&mut seed) * 3.0)));
+        let out = draw_snapped(&samples, 10.0);
+        assert_eq!(out, vec![pos2(0.0, 0.0), pos2(100.0, 100.0), pos2(200.0, 100.0)]);
+    }
+
+    #[test]
+    fn grid_pen_wrong_start_can_be_steered() {
+        // Start right, think better of it near the start, swing to the diagonal and carry on.
+        let mut samples: Vec<Pos2> = (0..=12).map(|x| pos2(x as f32, 0.0)).collect();
+        samples.extend((0..=9).map(|i| pos2(12.0 - i as f32 / 3.0, i as f32)));
+        samples.extend((10..=60).map(|i| pos2(i as f32, i as f32)));
+        assert_eq!(draw_snapped(&samples, 10.0), vec![pos2(0.0, 0.0), pos2(60.0, 60.0)]);
+    }
+
+    #[test]
+    fn grid_pen_retracing_removes_corners() {
+        // Right to (100,0), down to (100,50), back up, then back left along the first segment
+        // to (60,0), then diagonally down: the corner at (100,0) is gone.
+        let mut samples: Vec<Pos2> = (0..=100).map(|x| pos2(x as f32, 0.0)).collect();
+        samples.extend((1..=50).map(|y| pos2(100.0, y as f32)));
+        samples.extend((0..50).rev().map(|y| pos2(100.0, y as f32)));
+        samples.extend((60..100).rev().map(|x| pos2(x as f32, 0.0)));
+        samples.extend((1..=40).map(|i| pos2(60.0 + i as f32, i as f32)));
+        assert_eq!(
+            draw_snapped(&samples, 10.0),
+            vec![pos2(0.0, 0.0), pos2(60.0, 0.0), pos2(100.0, 40.0)]
+        );
+    }
+
+    #[test]
+    fn grid_pen_turns_without_notches() {
+        // A loose circle: no segment may double back on the previous one.
+        let samples: Vec<Pos2> = (0..=300)
+            .map(|i| {
+                let a = i as f32 / 300.0 * std::f32::consts::TAU;
+                pos2(120.0 * a.cos(), 120.0 * a.sin())
+            })
+            .collect();
+        let out = draw_snapped(&samples, 16.0);
+        for w in out.windows(3) {
+            let (d1, d2) = (w[1] - w[0], w[2] - w[1]);
+            assert!(d1.normalized().dot(d2.normalized()) > -0.1, "notch at {:?}", w[1]);
+        }
+    }
+
+    #[test]
+    fn grid_pen_draws_sharp_turns_when_meant() {
+        // A "Z": right, sharply back down-left, right again (two 135° turns).
+        let mut samples: Vec<Pos2> = (0..=100).map(|x| pos2(x as f32, 0.0)).collect();
+        samples.extend((1..=100).map(|i| pos2(100.0 - i as f32, i as f32)));
+        samples.extend((1..=100).map(|x| pos2(x as f32, 100.0)));
+        assert_eq!(
+            draw_snapped(&samples, 10.0),
+            vec![pos2(0.0, 0.0), pos2(100.0, 0.0), pos2(0.0, 100.0), pos2(100.0, 100.0)]
+        );
+    }
+
+    #[test]
+    fn grid_pen_segments_end_on_grid_at_45_degree_multiples() {
+        // A loose circle drawn with Shift: every corner is on the grid and every segment's
+        // angle is a multiple of 45°.
+        let samples: Vec<Pos2> = (0..=200)
+            .map(|i| {
+                let a = i as f32 / 200.0 * std::f32::consts::TAU;
+                pos2(80.0 * a.cos() + 3.0, 80.0 * a.sin() - 7.0)
+            })
+            .collect();
+        let out = draw_snapped(&samples, 16.0);
+        assert!(out.len() >= 8, "{out:?}");
+        for p in &out {
+            assert_eq!((p.x / 16.0).fract(), 0.0, "{p:?} off grid");
+            assert_eq!((p.y / 16.0).fract(), 0.0, "{p:?} off grid");
+        }
+        for w in out.windows(2) {
+            let d = w[1] - w[0];
+            assert!(d.x == 0.0 || d.y == 0.0 || d.x.abs() == d.y.abs(), "segment {d:?} not 0/45/90°");
+        }
     }
 
     #[test]

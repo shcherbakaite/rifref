@@ -1,21 +1,23 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 
+use eframe::egui::epaint::TextShape;
+use eframe::egui::text::{LayoutJob, TextFormat, TextWrapping};
 use eframe::egui::{
-    self, epaint::TextShape, pos2, vec2, Align2, Color32, CursorIcon, Event, FontId, Id, Key,
-    Margin, Mesh, Modifiers, Order, PointerButton, Pos2, Rect, Sense, Shape, Stroke, StrokeKind,
+    self, pos2, vec2, Align2, Color32, CursorIcon, Event, FontId, Id, Key, Mesh, Modifiers, Order,
+    PointerButton, Pos2, Rect, Sense, Shape, Stroke, StrokeKind,
     TextureFilter, TextureOptions, Vec2, ViewportCommand,
 };
 
 use crate::item::{
-    polyline_distance, rotate, segment_distance, stroke_geometry, Content, Frame as SelFrame,
-    ImageAsset, Item, Note, StrokeData, FULL_CROP, NOTE_DEFAULT_FONT, NOTE_DEFAULT_WIDTH, NOTE_PAD,
+    link_ends, polyline_distance, rotate, segment_distance, stroke_geometry, Content,
+    Frame as SelFrame, ImageAsset, Item, Link, StrokeData, FULL_CROP,
 };
 use crate::loader::{self, Decoded, Layout, LoadMsg};
 use crate::pdf;
-use crate::scene::{self, SavedItem, SavedKind, SceneFile};
+use crate::scene::{self, SavedItem, SavedKind, SavedLink, SceneFile};
 use crate::smooth;
 
 const HANDLE_PX: f32 = 9.0;
@@ -23,6 +25,13 @@ const ROTATE_PX: f32 = 28.0;
 const MIN_ZOOM: f32 = 0.005;
 const MAX_ZOOM: f32 = 100.0;
 const UNDO_LIMIT: usize = 200;
+/// Grid sizes (board pixels) that N / Shift+N step through.
+const GRID_PRESETS: [f32; 16] = [
+    2.0, 4.0, 5.0, 8.0, 10.0, 16.0, 20.0, 25.0, 32.0, 50.0, 64.0, 100.0, 128.0, 200.0, 256.0, 500.0,
+];
+const DEFAULT_GRID: f32 = 32.0;
+/// Dots closer than this on screen are thinned out (snapping still uses the real spacing).
+const MIN_DOT_SPACING_PX: f32 = 14.0;
 /// Smallest crop, in source pixels.
 const MIN_CROP_PX: f32 = 4.0;
 const ACCENT: Color32 = Color32::from_rgb(80, 160, 255);
@@ -42,15 +51,20 @@ const INK_COLORS: [Color32; 9] = [
     Color32::from_rgb(170, 90, 230),
 ];
 
-/// Note styles: (background, text). A transparent background uses the current ink colour for text.
-const NOTE_COLORS: [(Color32, Color32); 6] = [
-    (Color32::from_rgb(255, 238, 140), Color32::from_rgb(40, 35, 20)),
-    (Color32::from_rgb(255, 196, 208), Color32::from_rgb(50, 25, 30)),
-    (Color32::from_rgb(186, 220, 255), Color32::from_rgb(20, 35, 55)),
-    (Color32::from_rgb(198, 240, 186), Color32::from_rgb(25, 45, 20)),
-    (Color32::from_rgb(52, 52, 58), Color32::from_rgb(235, 235, 235)),
-    (Color32::TRANSPARENT, Color32::WHITE),
+/// Title bar / label colours, muted so white text stays readable.
+const TAG_COLORS: [Color32; 8] = [
+    Color32::from_rgb(72, 72, 76),
+    Color32::from_rgb(196, 64, 64),
+    Color32::from_rgb(222, 132, 52),
+    Color32::from_rgb(196, 168, 48),
+    Color32::from_rgb(56, 156, 96),
+    Color32::from_rgb(48, 150, 160),
+    Color32::from_rgb(64, 110, 200),
+    Color32::from_rgb(120, 86, 196),
 ];
+/// Link line width and arrowhead length, in screen pixels.
+const LINK_PX: f32 = 2.0;
+const ARROW_PX: f32 = 11.0;
 
 const BACKGROUNDS: [(&str, Color32); 4] = [
     ("Dark", Color32::from_rgb(34, 34, 36)),
@@ -64,7 +78,7 @@ enum Tool {
     Select,
     Pen,
     Eraser,
-    Note,
+    Link,
 }
 
 #[derive(Clone, Copy)]
@@ -101,8 +115,12 @@ enum Drag {
     Pan {
         last: Pos2,
     },
+    /// `orig`: (index, center) of each moved item; `anchor` is the point that lands on the grid
+    /// when snapping (see `snap_anchor`).
     Move {
-        last: Pos2,
+        start: Pos2,
+        anchor: Pos2,
+        orig: Vec<(usize, Pos2)>,
     },
     /// `orig`: (index, center, scale)
     Scale {
@@ -122,12 +140,34 @@ enum Drag {
         base: Vec<u64>,
     },
     Draw {
-        /// Raw pointer samples (world).
+        /// Pointer samples (world).
         points: Vec<Pos2>,
+        /// Per sample: snapped to the grid (Shift held) rather than freehand.
+        snapped: Vec<bool>,
+        grid_pen: smooth::GridPen,
     },
     Erase {
         changed: bool,
     },
+    /// Dragging a new link out of item `from`; `at` is the pointer (world).
+    Link {
+        from: u64,
+        at: Pos2,
+    },
+}
+
+/// Undo state: everything the user edits on the board.
+struct Snapshot {
+    items: Vec<Item>,
+    links: Vec<Link>,
+}
+
+/// An item title being typed in the inline editor.
+struct TitleEdit {
+    id: u64,
+    text: String,
+    /// Focus the text field on the next frame (just opened).
+    focus: bool,
 }
 
 enum Pending {
@@ -138,6 +178,7 @@ enum Pending {
 
 pub struct App {
     items: Vec<Item>,
+    links: Vec<Link>,
     next_id: u64,
 
     pan: Vec2,
@@ -147,10 +188,9 @@ pub struct App {
 
     tool: Tool,
     drag: Drag,
-    menu_pos: Pos2,
 
-    undo: Vec<Vec<Item>>,
-    redo: Vec<Vec<Item>>,
+    undo: Vec<Snapshot>,
+    redo: Vec<Snapshot>,
 
     path: Option<PathBuf>,
     dirty: bool,
@@ -166,20 +206,20 @@ pub struct App {
     paste_via_event: bool,
 
     pen_color: Color32,
+    /// Pen width in board pixels: strokes keep their size relative to the board at any zoom.
     pen_width: f32,
     /// Stroke smoothing strength, 0..=1.
     smoothing: f32,
     eraser_radius: f32,
-    note_style: usize,
 
-    editing: Option<u64>,
-    edit_original: Option<String>,
-    edit_focus_pending: bool,
 
     cropping: Option<CropState>,
+    title_edit: Option<TitleEdit>,
 
     background: Color32,
     grid: bool,
+    /// Grid spacing in board pixels.
+    grid_size: f32,
     always_on_top: bool,
     show_toolbar: bool,
     show_help: bool,
@@ -198,6 +238,7 @@ impl App {
         let (tx, rx) = channel();
         let mut app = Self {
             items: Vec::new(),
+            links: Vec::new(),
             next_id: 1,
             pan: Vec2::ZERO,
             zoom: 1.0,
@@ -205,7 +246,6 @@ impl App {
             canvas_rect: Rect::from_min_size(Pos2::ZERO, vec2(1200.0, 800.0)),
             tool: Tool::Select,
             drag: Drag::None,
-            menu_pos: Pos2::ZERO,
             undo: Vec::new(),
             redo: Vec::new(),
             path: None,
@@ -222,13 +262,11 @@ impl App {
             pen_width: 4.0,
             smoothing: 0.5,
             eraser_radius: 16.0,
-            note_style: 0,
-            editing: None,
-            edit_original: None,
-            edit_focus_pending: false,
             cropping: None,
+            title_edit: None,
             background: BACKGROUNDS[0].1,
             grid: false,
+            grid_size: DEFAULT_GRID,
             always_on_top: false,
             show_toolbar: true,
             show_help: false,
@@ -317,6 +355,54 @@ impl App {
         for it in &mut self.items {
             it.selected = false;
         }
+        for l in &mut self.links {
+            l.selected = false;
+        }
+    }
+
+    fn any_link_selected(&self) -> bool {
+        self.links.iter().any(|l| l.selected)
+    }
+
+    fn item_by_id(&self, id: u64) -> Option<&Item> {
+        self.items.iter().find(|it| it.id == id)
+    }
+
+    /// Endpoints of each drawable link (both items present and apart), by link index.
+    fn link_lines(&self) -> Vec<(usize, Pos2, Pos2)> {
+        let by_id: HashMap<u64, &Item> = self.items.iter().map(|it| (it.id, it)).collect();
+        self.links
+            .iter()
+            .enumerate()
+            .filter_map(|(i, l)| {
+                let (a, b) = (by_id.get(&l.from)?, by_id.get(&l.to)?);
+                link_ends(a, b).map(|(pa, pb)| (i, pa, pb))
+            })
+            .collect()
+    }
+
+    /// Topmost link passing near `w`.
+    fn hit_link(&self, w: Pos2) -> Option<usize> {
+        let tol = 6.0 / self.zoom;
+        self.link_lines()
+            .into_iter()
+            .rev()
+            .find(|&(_, a, b)| segment_distance(w, a, b) <= tol)
+            .map(|(i, ..)| i)
+    }
+
+    /// Link under `w` unless a stroke (drawn above links) is in the way.
+    fn hit_link_on_top(&self, w: Pos2) -> Option<usize> {
+        match self.hit_item(w) {
+            Some(i) if self.items[i].is_stroke() => None,
+            _ => self.hit_link(w),
+        }
+    }
+
+    /// Drop links whose items no longer exist.
+    fn prune_links(&mut self) {
+        let ids: HashSet<u64> = self.items.iter().map(|it| it.id).collect();
+        self.links.retain(|l| ids.contains(&l.from) && ids.contains(&l.to));
     }
 
     fn union_aabb(&self, selected_only: bool) -> Option<Rect> {
@@ -346,6 +432,21 @@ impl App {
     }
 
     /// Topmost item under `w`. Strokes form the top layer, so they are tested first.
+    /// The point of the selection that Shift-moving puts on the grid: the first point of a selected
+    /// stroke (so strokes drawn on the grid stay on it), otherwise an image's top-left corner.
+    fn snap_anchor(&self) -> Option<Pos2> {
+        let stroke_point = self.selected().find_map(|it| match &it.content {
+            Content::Stroke(s) => s.points.first().map(|p| it.local_to_world(p.to_vec2())),
+            _ => None,
+        });
+        stroke_point.or_else(|| {
+            self.selected().next().map(|it| {
+                let h = it.size * 0.5;
+                it.local_to_world(vec2(-h.x, -h.y))
+            })
+        })
+    }
+
     fn hit_item(&self, w: Pos2) -> Option<usize> {
         let tol = 5.0 / self.zoom;
         let hit = |strokes: bool| {
@@ -383,8 +484,22 @@ impl App {
 
     // ------------------------------------------------------------------ undo
 
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            items: self.items.clone(),
+            links: self.links.clone(),
+        }
+    }
+
+    fn restore(&mut self, s: Snapshot) -> Snapshot {
+        Snapshot {
+            items: std::mem::replace(&mut self.items, s.items),
+            links: std::mem::replace(&mut self.links, s.links),
+        }
+    }
+
     fn push_undo(&mut self) {
-        self.undo.push(self.items.clone());
+        self.undo.push(self.snapshot());
         if self.undo.len() > UNDO_LIMIT {
             self.undo.remove(0);
         }
@@ -393,19 +508,19 @@ impl App {
     }
 
     fn undo(&mut self) {
-        self.finish_editing();
         self.finish_crop();
         if let Some(prev) = self.undo.pop() {
-            self.redo.push(std::mem::replace(&mut self.items, prev));
+            let cur = self.restore(prev);
+            self.redo.push(cur);
             self.dirty = true;
         }
     }
 
     fn redo(&mut self) {
-        self.finish_editing();
         self.finish_crop();
         if let Some(next) = self.redo.pop() {
-            self.undo.push(std::mem::replace(&mut self.items, next));
+            let cur = self.restore(next);
+            self.undo.push(cur);
             self.dirty = true;
         }
     }
@@ -572,9 +687,10 @@ impl App {
     // ----------------------------------------------------------------- scenes
 
     fn clear_scene(&mut self) {
-        self.finish_editing();
         self.cropping = None;
+        self.title_edit = None;
         self.items.clear();
+        self.links.clear();
         self.undo.clear();
         self.redo.clear();
         self.path = None;
@@ -588,9 +704,11 @@ impl App {
         let mut scene = SceneFile::new(
             self.background.to_array(),
             self.grid,
+            self.grid_size,
             ([offset.x, offset.y], self.zoom),
         );
         let mut image_index: HashMap<*const ImageAsset, usize> = HashMap::new();
+        let mut item_index: HashMap<u64, usize> = HashMap::new();
         for it in &self.items {
             let kind = match &it.content {
                 Content::Image(a) => {
@@ -603,13 +721,6 @@ impl App {
                         crop: (c != FULL_CROP).then_some([c.min.x, c.min.y, c.max.x, c.max.y]),
                     }
                 }
-                Content::Note(n) => SavedKind::Note {
-                    text: n.text.clone(),
-                    width: it.size.x,
-                    bg: n.bg.to_array(),
-                    fg: n.fg.to_array(),
-                    font_size: n.font_size,
-                },
                 Content::Stroke(s) => SavedKind::Stroke {
                     points: s.points.iter().map(|p| [p.x, p.y]).collect(),
                     color: s.color.to_array(),
@@ -617,15 +728,30 @@ impl App {
                     size: [it.size.x, it.size.y],
                 },
             };
+            item_index.insert(it.id, scene.items.len());
             scene.items.push(SavedItem {
                 center: [it.center.x, it.center.y],
                 scale: it.scale,
                 rotation: it.rotation,
                 flip_x: it.flip_x,
                 flip_y: it.flip_y,
+                title: it.title.clone(),
+                tag: it.tag.map(|c| c.to_array()),
                 kind,
             });
         }
+        scene.links = self
+            .links
+            .iter()
+            .filter_map(|l| {
+                Some(SavedLink {
+                    from: *item_index.get(&l.from)?,
+                    to: *item_index.get(&l.to)?,
+                    color: l.color.to_array(),
+                    arrow: l.arrow,
+                })
+            })
+            .collect();
         scene
     }
 
@@ -642,7 +768,12 @@ impl App {
             .map(|d| d.map(|d| self.make_asset(ctx, d)))
             .collect();
         let mut missing = 0;
+        // Items this version no longer supports (e.g. text notes from older boards).
+        let mut skipped = 0;
+        // New item id for each saved item index, for reconnecting links.
+        let mut ids: Vec<Option<u64>> = Vec::with_capacity(scene.items.len());
         for s in scene.items {
+            ids.push(None);
             let center = pos2(s.center[0], s.center[1]);
             let mut crop_rect = FULL_CROP;
             let (content, size) = match s.kind {
@@ -660,21 +791,10 @@ impl App {
                         continue;
                     }
                 },
-                SavedKind::Note {
-                    text,
-                    width,
-                    bg,
-                    fg,
-                    font_size,
-                } => (
-                    Content::Note(Note {
-                        text,
-                        bg: color(bg),
-                        fg: color(fg),
-                        font_size,
-                    }),
-                    vec2(width, font_size + 2.0 * NOTE_PAD),
-                ),
+                SavedKind::Unsupported => {
+                    skipped += 1;
+                    continue;
+                }
                 SavedKind::Stroke {
                     points,
                     color: c,
@@ -696,10 +816,28 @@ impl App {
             it.flip_x = s.flip_x;
             it.flip_y = s.flip_y;
             it.crop = crop_rect;
+            it.title = s.title;
+            it.tag = s.tag.map(color);
+            *ids.last_mut().unwrap() = Some(id);
             self.items.push(it);
         }
+        let id_at = |i: usize| ids.get(i).copied().flatten();
+        self.links = scene
+            .links
+            .iter()
+            .filter_map(|l| {
+                Some(Link {
+                    from: id_at(l.from)?,
+                    to: id_at(l.to)?,
+                    color: color(l.color),
+                    arrow: l.arrow,
+                    selected: false,
+                })
+            })
+            .collect();
         self.background = color(scene.background);
         self.grid = scene.grid;
+        self.grid_size = scene.grid_size.unwrap_or(DEFAULT_GRID).clamp(1.0, 2000.0);
         match scene.view {
             Some((offset, zoom)) => {
                 self.zoom = zoom.clamp(MIN_ZOOM, MAX_ZOOM);
@@ -707,19 +845,21 @@ impl App {
             }
             None => self.fit(),
         }
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let mut msg = format!("Opened {name}");
         if missing > 0 {
-            self.set_status(ctx, format!("{missing} image(s) could not be decoded"));
-        } else {
-            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            self.set_status(ctx, format!("Opened {name}"));
+            msg += &format!(" · {missing} image(s) could not be decoded");
         }
+        if skipped > 0 {
+            msg += &format!(" · {skipped} unsupported item(s) skipped (e.g. text notes)");
+        }
+        self.set_status(ctx, msg);
         self.path = Some(path);
         self.dirty = false;
     }
 
     /// Returns true if the board was saved.
     fn save_board(&mut self, ctx: &egui::Context, save_as: bool) -> bool {
-        self.finish_editing();
         self.finish_crop();
         let path = if save_as || self.path.is_none() {
             rfd::FileDialog::new()
@@ -795,9 +935,11 @@ impl App {
     // --------------------------------------------------------------- commands
 
     fn delete_selected(&mut self) {
-        if self.any_selected() {
+        if self.any_selected() || self.any_link_selected() {
             self.push_undo();
             self.items.retain(|i| !i.selected);
+            self.links.retain(|l| !l.selected);
+            self.prune_links();
         }
     }
 
@@ -823,18 +965,35 @@ impl App {
                 copies.push(c);
             }
         }
+        let mut new_ids = HashMap::new();
         for mut c in copies {
-            c.id = self.alloc_id();
+            let id = self.alloc_id();
+            new_ids.insert(c.id, id);
+            c.id = id;
             self.items.push(c);
         }
+        // Links inside the duplicated group come along.
+        let copied: Vec<Link> = self
+            .links
+            .iter()
+            .filter_map(|l| {
+                Some(Link {
+                    from: *new_ids.get(&l.from)?,
+                    to: *new_ids.get(&l.to)?,
+                    selected: false,
+                    ..l.clone()
+                })
+            })
+            .collect();
+        self.links.extend(copied);
     }
 
     fn flip(&mut self, horizontal: bool) {
-        if !self.selected().any(|i| !i.is_note()) {
+        if !self.any_selected() {
             return;
         }
         self.push_undo();
-        for it in self.items.iter_mut().filter(|i| i.selected && !i.is_note()) {
+        for it in self.items.iter_mut().filter(|i| i.selected) {
             if horizontal {
                 it.flip_x = !it.flip_x;
             } else {
@@ -930,49 +1089,134 @@ impl App {
     }
 
     fn recolor_ink(&mut self, c: Color32) {
-        let applies = |it: &Item| match &it.content {
-            Content::Stroke(_) => true,
-            Content::Note(n) => n.bg.a() == 0,
-            _ => false,
+        if !self.selected().any(Item::is_stroke) && !self.any_link_selected() {
+            return;
+        }
+        self.push_undo();
+        for l in self.links.iter_mut().filter(|l| l.selected) {
+            l.color = c;
+        }
+        for it in self.items.iter_mut().filter(|i| i.selected) {
+            if let Content::Stroke(s) = &mut it.content {
+                s.color = c;
+            }
+        }
+    }
+
+    // ----------------------------------------------------------- titles, links
+
+    /// Open the inline title editor on image `idx`.
+    fn start_title_edit(&mut self, idx: usize) {
+        self.finish_crop();
+        let it = &self.items[idx];
+        self.title_edit = Some(TitleEdit {
+            id: it.id,
+            text: it.title.clone(),
+            focus: true,
+        });
+    }
+
+    /// Title the single selected image (T / F2 / menu).
+    fn title_selected(&mut self, ctx: &egui::Context) {
+        match self.single_selected_image() {
+            Some(i) => self.start_title_edit(i),
+            None => self.set_status(ctx, "Select a single image to give it a title"),
+        }
+    }
+
+    fn commit_title(&mut self) {
+        let Some(edit) = self.title_edit.take() else {
+            return;
         };
-        if !self.selected().any(applies) {
+        let text = edit.text.trim().to_string();
+        let Some(i) = self.items.iter().position(|it| it.id == edit.id) else {
             return;
-        }
-        self.push_undo();
-        for it in self.items.iter_mut().filter(|i| i.selected) {
-            match &mut it.content {
-                Content::Stroke(s) => s.color = c,
-                Content::Note(n) if n.bg.a() == 0 => n.fg = c,
-                _ => {}
-            }
+        };
+        if self.items[i].title != text {
+            self.push_undo();
+            self.items[i].title = text;
         }
     }
 
-    fn note_colors(&self, style: usize) -> (Color32, Color32) {
-        let (bg, fg) = NOTE_COLORS[style];
-        if bg.a() == 0 {
-            (bg, self.pen_color)
+    fn has_selected_image(&self) -> bool {
+        self.selected().any(|it| !it.is_stroke())
+    }
+
+    /// Set the label colour of the selected images (`None`: default).
+    fn set_tag(&mut self, tag: Option<Color32>) {
+        if !self.selected().any(|it| !it.is_stroke() && it.tag != tag) {
+            return;
+        }
+        self.push_undo();
+        for it in self.items.iter_mut().filter(|i| i.selected && !i.is_stroke()) {
+            it.tag = tag;
+        }
+    }
+
+    /// Connect two items; returns false if they already are (either direction).
+    fn add_link(&mut self, from: u64, to: u64) -> bool {
+        if from == to
+            || self
+                .links
+                .iter()
+                .any(|l| (l.from, l.to) == (from, to) || (l.from, l.to) == (to, from))
+        {
+            return false;
+        }
+        self.push_undo();
+        self.deselect_all();
+        self.links.push(Link {
+            from,
+            to,
+            color: self.pen_color,
+            arrow: true,
+            selected: true,
+        });
+        true
+    }
+
+    fn reverse_links(&mut self) {
+        if !self.any_link_selected() {
+            return;
+        }
+        self.push_undo();
+        for l in self.links.iter_mut().filter(|l| l.selected) {
+            std::mem::swap(&mut l.from, &mut l.to);
+        }
+    }
+
+    fn set_link_arrows(&mut self, arrow: bool) {
+        if !self.links.iter().any(|l| l.selected && l.arrow != arrow) {
+            return;
+        }
+        self.push_undo();
+        for l in self.links.iter_mut().filter(|l| l.selected) {
+            l.arrow = arrow;
+        }
+    }
+
+    /// Move to the next larger (`dir` > 0) or smaller preset grid size, KiCad style.
+    fn step_grid(&mut self, dir: i32) {
+        let next = if dir > 0 {
+            GRID_PRESETS.iter().find(|&&g| g > self.grid_size + 1e-3)
         } else {
-            (bg, fg)
+            GRID_PRESETS.iter().rev().find(|&&g| g < self.grid_size - 1e-3)
+        };
+        if let Some(&g) = next {
+            self.set_grid_size(g);
         }
+        self.grid = true;
     }
 
-    fn restyle_notes(&mut self, style: usize) {
-        if !self.selected().any(Item::is_note) {
-            return;
-        }
-        self.push_undo();
-        let (bg, fg) = self.note_colors(style);
-        for it in self.items.iter_mut().filter(|i| i.selected) {
-            if let Some(n) = it.note_mut() {
-                n.bg = bg;
-                n.fg = fg;
-            }
+    fn set_grid_size(&mut self, g: f32) {
+        let g = g.clamp(1.0, 2000.0);
+        if g != self.grid_size {
+            self.grid_size = g;
+            self.dirty = true;
         }
     }
 
     fn set_tool(&mut self, tool: Tool) {
-        self.finish_editing();
         self.finish_crop();
         self.tool = tool;
     }
@@ -1000,7 +1244,6 @@ impl App {
             self.set_status(ctx, "Select a single image to crop");
             return;
         };
-        self.finish_editing();
         self.tool = Tool::Select;
         self.push_undo();
         self.cropping = Some(CropState {
@@ -1163,100 +1406,13 @@ impl App {
         }
     }
 
-    // ------------------------------------------------------------------ notes
-
-    fn add_note(&mut self, at: Pos2, text: String) -> usize {
-        let (bg, fg) = self.note_colors(self.note_style);
-        let id = self.alloc_id();
-        // Notes keep a constant on-screen size when created, whatever the zoom.
-        let mut it = Item::new(
-            id,
-            Content::Note(Note {
-                text,
-                bg,
-                fg,
-                font_size: NOTE_DEFAULT_FONT,
-            }),
-            at,
-            vec2(NOTE_DEFAULT_WIDTH, NOTE_DEFAULT_FONT + 2.0 * NOTE_PAD),
-        );
-        it.scale = 1.0 / self.zoom;
-        // Anchor the top-left corner at the click position.
-        it.center = at + it.half();
-        self.deselect_all();
-        it.selected = true;
-        self.items.push(it);
-        self.items.len() - 1
-    }
-
-    fn create_note(&mut self, at: Pos2) {
-        self.finish_editing();
-        self.push_undo();
-        let idx = self.add_note(at, String::new());
-        self.editing = Some(self.items[idx].id);
-        self.edit_original = None;
-        self.edit_focus_pending = true;
-    }
-
-    fn start_editing(&mut self, idx: usize) {
-        self.finish_editing();
-        let Some(text) = self.items[idx].note_mut().map(|n| n.text.clone()) else {
-            return;
-        };
-        self.push_undo();
-        self.deselect_all();
-        self.items[idx].selected = true;
-        self.editing = Some(self.items[idx].id);
-        self.edit_original = Some(text);
-        self.edit_focus_pending = true;
-    }
-
-    fn finish_editing(&mut self) {
-        let Some(id) = self.editing.take() else {
-            return;
-        };
-        let original = self.edit_original.take();
-        let Some(idx) = self.items.iter().position(|i| i.id == id) else {
-            return;
-        };
-        let text = self.items[idx]
-            .note_mut()
-            .map(|n| n.text.clone())
-            .unwrap_or_default();
-        if text.trim().is_empty() {
-            self.items.remove(idx);
-            if original.is_none() {
-                // A freshly created note that was never filled in: nothing happened.
-                self.undo.pop();
-            }
-        } else if original.as_deref() == Some(text.as_str()) {
-            self.undo.pop();
-        }
-    }
-
-    /// Keep note heights in sync with their wrapped text.
-    fn layout_notes(&mut self, painter: &egui::Painter) {
-        for it in &mut self.items {
-            if let Content::Note(n) = &it.content {
-                let wrap = (it.size.x - 2.0 * NOTE_PAD).max(10.0);
-                let g = painter.layout(
-                    n.text.clone(),
-                    FontId::proportional(n.font_size),
-                    n.fg,
-                    wrap,
-                );
-                it.size.y = g.size().y.max(n.font_size) + 2.0 * NOTE_PAD;
-            }
-        }
-    }
-
     // ---------------------------------------------------------------- sketching
 
     fn commit_stroke(&mut self, points: Vec<Pos2>) {
         if points.is_empty() {
             return;
         }
-        let width = self.pen_width / self.zoom;
+        let width = self.pen_width;
         let (center, size, local) = stroke_geometry(&points, width);
         self.push_undo();
         let id = self.alloc_id();
@@ -1274,7 +1430,21 @@ impl App {
 
     /// Erase stroke parts within `radius` (world units) of `w`, splitting strokes as needed.
     fn erase_at(&mut self, w: Pos2, radius: f32) -> bool {
-        let mut changed = false;
+        // Links the eraser touches go away whole.
+        let doomed: HashSet<usize> = self
+            .link_lines()
+            .into_iter()
+            .filter(|&(_, a, b)| segment_distance(w, a, b) <= radius)
+            .map(|(i, ..)| i)
+            .collect();
+        let mut changed = !doomed.is_empty();
+        if changed {
+            let mut i = 0;
+            self.links.retain(|_| {
+                i += 1;
+                !doomed.contains(&(i - 1))
+            });
+        }
         let mut i = 0;
         while i < self.items.len() {
             let it = &self.items[i];
@@ -1339,6 +1509,8 @@ impl App {
             i += n;
             changed = true;
         }
+        // Erasing a linked stroke replaces it with new pieces.
+        self.prune_links();
         changed
     }
 
@@ -1381,17 +1553,15 @@ impl App {
                 self.request(ctx, Pending::Open(Some(s)));
             }
         } else {
-            self.push_undo();
-            self.add_note(at, text.trim_end().to_owned());
+            self.set_status(ctx, "Nothing to paste: the clipboard has no image or image file");
         }
     }
 
-    /// Copies the first selected image (or note text) to the system clipboard.
+    /// Copies the first selected image (cropped) to the system clipboard.
     fn copy(&mut self, ctx: &egui::Context) -> bool {
         let Some(it) = self
             .selected()
             .find(|i| matches!(i.content, Content::Image(_)))
-            .or_else(|| self.selected().find(|i| i.is_note()))
         else {
             return false;
         };
@@ -1423,13 +1593,6 @@ impl App {
                         .set_image(data)
                         .map_err(|e| e.to_string())
                 }),
-            Content::Note(n) => {
-                let text = n.text.clone();
-                self.clipboard
-                    .as_mut()
-                    .ok_or("no clipboard".to_string())
-                    .and_then(|cb| cb.set_text(text).map_err(|e| e.to_string()))
-            }
             Content::Stroke(_) => return false,
         };
         match result {
@@ -1582,11 +1745,21 @@ impl App {
         if k(none, Key::E) {
             self.set_tool(Tool::Eraser);
         }
-        if k(none, Key::T) || k(none, Key::N) {
-            self.set_tool(Tool::Note);
+        if k(none, Key::L) {
+            self.set_tool(Tool::Link);
+        }
+        if k(none, Key::T) || k(none, Key::F2) {
+            self.title_selected(ctx);
+            // The T keypress also arrives as typed text; keep it out of the new title.
+            ctx.input_mut(|i| i.events.retain(|e| !matches!(e, Event::Text(_))));
         }
         if k(none, Key::G) {
             self.grid = !self.grid;
+        }
+        if k(Modifiers::SHIFT, Key::N) {
+            self.step_grid(-1);
+        } else if k(none, Key::N) {
+            self.step_grid(1);
         }
         if k(none, Key::Tab) {
             self.show_toolbar = !self.show_toolbar;
@@ -1612,7 +1785,7 @@ impl App {
         if self.tool == Tool::Eraser {
             self.eraser_radius = (self.eraser_radius * f).clamp(2.0, 200.0);
         } else {
-            self.pen_width = (self.pen_width * f).clamp(1.0, 60.0);
+            self.pen_width = (self.pen_width * f).clamp(0.5, 200.0);
         }
     }
 
@@ -1642,13 +1815,32 @@ impl App {
             self.finish_crop();
         }
         match self.tool {
-            Tool::Pen => self.drag = Drag::Draw { points: vec![w] },
+            Tool::Pen => {
+                let (w, snapped) = if mods.shift {
+                    (snap(w, self.grid_size), true)
+                } else {
+                    (w, false)
+                };
+                self.drag = Drag::Draw {
+                    points: vec![w],
+                    snapped: vec![snapped],
+                    grid_pen: smooth::GridPen::default(),
+                }
+            }
             Tool::Eraser => {
                 self.push_undo();
                 let changed = self.erase_at(w, self.eraser_radius / self.zoom);
                 self.drag = Drag::Erase { changed };
             }
-            Tool::Select | Tool::Note => {
+            Tool::Link => {
+                if let Some(i) = self.hit_item(w) {
+                    self.drag = Drag::Link {
+                        from: self.items[i].id,
+                        at: w,
+                    };
+                }
+            }
+            Tool::Select => {
                 if let Some(h) = self.hit_handle(origin, mods) {
                     let frame = self.selection_frame().expect("handle implies selection");
                     let corners = frame.corners();
@@ -1682,7 +1874,14 @@ impl App {
                         self.items[i].selected = true;
                     }
                     self.push_undo();
-                    self.drag = Drag::Move { last: w };
+                    self.drag = Drag::Move {
+                        start: w,
+                        anchor: self.snap_anchor().unwrap_or(w),
+                        orig: (0..self.items.len())
+                            .filter(|&i| self.items[i].selected)
+                            .map(|i| (i, self.items[i].center))
+                            .collect(),
+                    };
                 } else {
                     let base = if mods.shift || mods.command {
                         self.selected().map(|i| i.id).collect()
@@ -1699,6 +1898,7 @@ impl App {
     fn continue_drag(&mut self, pos: Pos2, mods: Modifiers) {
         let w = self.s2w(pos);
         let zoom = self.zoom;
+        let grid = self.grid_size;
         if let Drag::Crop {
             grip,
             orig,
@@ -1706,6 +1906,12 @@ impl App {
         } = &self.drag
         {
             let (grip, orig, start_px) = (*grip, orig.clone(), *start_px);
+            // With Shift, dragged crop edges land on grid lines.
+            let w = if mods.shift && matches!(grip, CropGrip::Edges { .. }) {
+                snap(w, self.grid_size)
+            } else {
+                w
+            };
             self.drag_crop(grip, &orig, start_px, w);
             return;
         }
@@ -1715,11 +1921,19 @@ impl App {
                 self.pan += pos - *last;
                 *last = pos;
             }
-            Drag::Move { last } => {
-                let d = w - *last;
-                *last = w;
-                for it in self.items.iter_mut().filter(|i| i.selected) {
-                    it.center += d;
+            Drag::Move {
+                start,
+                anchor,
+                orig,
+            } => {
+                let mut d = w - *start;
+                if mods.shift {
+                    d = snap(*anchor + d, grid) - *anchor;
+                }
+                for &(i, c) in orig.iter() {
+                    if let Some(it) = self.items.get_mut(i) {
+                        it.center = c + d;
+                    }
                 }
             }
             Drag::Scale {
@@ -1727,6 +1941,8 @@ impl App {
                 start,
                 orig,
             } => {
+                // With Shift, the dragged corner lands on a grid point.
+                let w = if mods.shift { snap(w, grid) } else { w };
                 let d = *start - *anchor;
                 let s = ((w - *anchor).dot(d) / d.length_sq().max(1e-6)).max(0.02);
                 for &(i, c, sc) in orig.iter() {
@@ -1759,9 +1975,20 @@ impl App {
                     it.selected = base.contains(&it.id) || r.intersects(it.world_aabb());
                 }
             }
-            Drag::Draw { points } => {
-                if points.last().is_none_or(|l| l.distance(w) * zoom >= 1.0) {
+            Drag::Draw {
+                points,
+                snapped,
+                grid_pen,
+            } => {
+                if mods.shift {
+                    // 0/45/90° segments between grid points, KiCad style.
+                    // Leaving a line takes half a grid step, or 6px on screen if that's more,
+                    // so hand jitter on a fine grid doesn't add corners.
+                    grid_pen.add(points, snapped, w, grid, (grid * 0.5).max(6.0 / zoom));
+                } else if points.last().is_none_or(|l| l.distance(w) * zoom >= 1.0) {
+                    grid_pen.release();
                     points.push(w);
+                    snapped.push(false);
                 }
             }
             Drag::Erase { changed } => {
@@ -1769,17 +1996,29 @@ impl App {
                 let now = self.erase_at(w, self.eraser_radius / zoom);
                 self.drag = Drag::Erase { changed: c || now };
             }
+            Drag::Link { at, .. } => *at = w,
         }
     }
 
-    fn end_drag(&mut self) {
+    fn end_drag(&mut self, ctx: &egui::Context) {
         match std::mem::replace(&mut self.drag, Drag::None) {
-            Drag::Draw { points } => {
-                let points = smooth::finish_stroke(&points, self.smoothing, 1.0 / self.zoom);
+            Drag::Draw {
+                points, snapped, ..
+            } => {
+                let points =
+                    smooth::finish_mixed(&points, &snapped, self.smoothing, 1.0 / self.zoom);
                 self.commit_stroke(points);
             }
             Drag::Erase { changed: false } => {
                 self.undo.pop();
+            }
+            Drag::Link { from, at } => {
+                if let Some(i) = self.hit_item(at) {
+                    let to = self.items[i].id;
+                    if to != from && !self.add_link(from, to) {
+                        self.set_status(ctx, "Those two are already linked");
+                    }
+                }
             }
             _ => {}
         }
@@ -1793,7 +2032,17 @@ impl App {
             self.finish_crop();
         }
         match self.tool {
-            Tool::Select => match self.hit_item(w) {
+            // Links are selected by clicking them, with the Select or the Link tool.
+            Tool::Select | Tool::Link if self.hit_link_on_top(w).is_some() => {
+                let l = self.hit_link_on_top(w).unwrap();
+                if mods.shift || mods.command {
+                    self.links[l].selected = !self.links[l].selected;
+                } else {
+                    self.deselect_all();
+                    self.links[l].selected = true;
+                }
+            }
+            Tool::Select | Tool::Link => match self.hit_item(w) {
                 Some(i) if mods.shift || mods.command => {
                     self.items[i].selected = !self.items[i].selected;
                 }
@@ -1807,14 +2056,10 @@ impl App {
                     }
                 }
             },
-            Tool::Note => {
-                match self.hit_item(w) {
-                    Some(i) if self.items[i].is_note() => self.start_editing(i),
-                    _ => self.create_note(w),
-                }
-                self.tool = Tool::Select;
+            Tool::Pen => {
+                let w = if mods.shift { snap(w, self.grid_size) } else { w };
+                self.commit_stroke(vec![w]);
             }
-            Tool::Pen => self.commit_stroke(vec![w]),
             Tool::Eraser => {
                 self.push_undo();
                 if !self.erase_at(w, self.eraser_radius / self.zoom) {
@@ -1830,7 +2075,7 @@ impl App {
             return;
         }
         match self.hit_item(w) {
-            Some(i) if self.items[i].is_note() => self.start_editing(i),
+            Some(i) if self.items[i].hit_title(w) => self.start_title_edit(i),
             Some(i) => {
                 let r = self.items[i].world_aabb();
                 self.fit_rect(r);
@@ -1881,7 +2126,6 @@ impl App {
         // Pointer interaction.
         let pointer = resp.interact_pointer_pos().or(hover);
         if resp.drag_started() {
-            self.finish_editing();
             let origin = press_origin.or(pointer).unwrap_or(rect.center());
             if resp.dragged_by(PointerButton::Middle)
                 || resp.dragged_by(PointerButton::Secondary)
@@ -1915,20 +2159,22 @@ impl App {
             }
         }
         if resp.drag_stopped() {
-            self.end_drag();
+            self.end_drag(&ctx);
         }
         if let Some(p) = pointer {
             let w = self.s2w(p);
             if resp.double_clicked() && self.tool == Tool::Select {
                 self.double_click(w);
             } else if resp.clicked() {
-                self.finish_editing();
                 self.click(w, mods);
             }
             if resp.secondary_clicked() {
-                self.finish_editing();
-                self.menu_pos = w;
-                if let Some(i) = self.hit_item(w) {
+                if let Some(l) = self.hit_link_on_top(w) {
+                    if !self.links[l].selected {
+                        self.deselect_all();
+                        self.links[l].selected = true;
+                    }
+                } else if let Some(i) = self.hit_item(w) {
                     if !self.items[i].selected {
                         self.deselect_all();
                         self.items[i].selected = true;
@@ -1947,8 +2193,12 @@ impl App {
             } else {
                 match self.tool {
                     Tool::Pen => CursorIcon::Crosshair,
+                    Tool::Link => match hover.map(|p| self.s2w(p)) {
+                        Some(w) if self.hit_item(w).is_some() => CursorIcon::Crosshair,
+                        Some(w) if self.hit_link(w).is_some() => CursorIcon::PointingHand,
+                        _ => CursorIcon::Default,
+                    },
                     Tool::Eraser => CursorIcon::None,
-                    Tool::Note => CursorIcon::Text,
                     Tool::Select if self.cropping.is_some() => {
                         match hover.and_then(|p| self.hit_crop(p)) {
                             Some(CropGrip::Edges {
@@ -1992,28 +2242,30 @@ impl App {
         if self.grid {
             self.draw_grid(&painter, rect);
         }
-        self.layout_notes(&painter);
-        // Pen strokes always sit above images and notes.
+        // Layers: images, then links between them, then pen strokes on top.
         let (strokes, others): (Vec<&Item>, Vec<&Item>) =
             self.items.iter().partition(|it| it.is_stroke());
-        for it in others.into_iter().chain(strokes) {
+        let visible = |it: &&&Item| {
             let aabb = it.world_aabb();
-            let screen = Rect::from_two_pos(self.w2s(aabb.min), self.w2s(aabb.max));
-            if screen.intersects(rect) {
-                self.draw_item(&painter, it);
-            }
+            Rect::from_two_pos(self.w2s(aabb.min), self.w2s(aabb.max)).intersects(rect)
+        };
+        for it in others.iter().filter(visible) {
+            self.draw_item(&painter, it);
+        }
+        self.draw_links(&painter);
+        for it in strokes.iter().filter(visible) {
+            self.draw_item(&painter, it);
         }
         self.draw_selection(&painter);
         self.draw_overlays(&ctx, &painter, rect, hover);
     }
 
     fn draw_grid(&self, painter: &egui::Painter, rect: Rect) {
-        let mut step = 32.0;
-        while step * self.zoom < 24.0 {
-            step *= 2.0;
-        }
-        while step * self.zoom > 96.0 {
-            step /= 2.0;
+        // Draw every 1st/2nd/5th/10th/20th... grid point so dots never crowd together.
+        let mut step = self.grid_size;
+        let mut multiples = [2.0, 2.5, 2.0].iter().cycle();
+        while step * self.zoom < MIN_DOT_SPACING_PX {
+            step *= multiples.next().unwrap();
         }
         let tl = self.s2w(rect.min);
         let br = self.s2w(rect.max);
@@ -2035,7 +2287,6 @@ impl App {
     }
 
     fn draw_item(&self, painter: &egui::Painter, it: &Item) {
-        let editing = self.editing == Some(it.id);
         match &it.content {
             Content::Image(a) => {
                 if self.cropping.as_ref().is_some_and(|c| c.id == it.id) {
@@ -2046,50 +2297,7 @@ impl App {
                 }
                 let visible = Rect::from_center_size(Pos2::ZERO, it.size);
                 self.paint_image(painter, it, a, it.crop, visible, Color32::WHITE);
-            }
-            Content::Note(n) => {
-                // While editing, the note is shown upright so it lines up with the text editor.
-                let corners: Vec<Pos2> = if editing {
-                    let h = it.half();
-                    let r = Rect::from_min_max(self.w2s(it.center - h), self.w2s(it.center + h));
-                    vec![r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom()]
-                } else {
-                    it.corners().iter().map(|c| self.w2s(*c)).collect()
-                };
-                if n.bg.a() > 0 {
-                    // Soft drop shadow.
-                    let off = vec2(2.0, 3.0);
-                    painter.add(Shape::convex_polygon(
-                        corners.iter().map(|c| *c + off).collect(),
-                        Color32::from_black_alpha(60),
-                        Stroke::NONE,
-                    ));
-                    painter.add(Shape::convex_polygon(corners, n.bg, Stroke::NONE));
-                } else if editing || n.text.is_empty() {
-                    painter.add(Shape::closed_line(
-                        corners,
-                        Stroke::new(1.0, Color32::from_gray(120)),
-                    ));
-                }
-                if !editing {
-                    let fs = n.font_size * it.scale * self.zoom;
-                    if fs >= 2.0 {
-                        let wrap = (it.size.x - 2.0 * NOTE_PAD) * it.scale * self.zoom;
-                        let galley = painter.layout(
-                            n.text.clone(),
-                            FontId::proportional(fs.min(400.0)),
-                            n.fg,
-                            wrap.max(1.0),
-                        );
-                        let tl = it.local_to_world(vec2(
-                            -it.size.x * 0.5 + NOTE_PAD,
-                            -it.size.y * 0.5 + NOTE_PAD,
-                        ));
-                        painter.add(
-                            TextShape::new(self.w2s(tl), galley, n.fg).with_angle(it.rotation),
-                        );
-                    }
-                }
+                self.draw_card(painter, it);
             }
             Content::Stroke(s) => {
                 let pts: Vec<Pos2> = s
@@ -2100,6 +2308,61 @@ impl App {
                 let w = (s.width * it.scale * self.zoom).max(0.75);
                 draw_polyline(painter, pts, w, s.color);
             }
+        }
+    }
+
+    /// Title bar and coloured border of a titled or labelled image.
+    fn draw_card(&self, painter: &egui::Painter, it: &Item) {
+        if it.title.is_empty() && it.tag.is_none() {
+            return;
+        }
+        let tag = it.tag.unwrap_or(TAG_COLORS[0]);
+        let card: Vec<Pos2> = it.card_corners().iter().map(|p| self.w2s(*p)).collect();
+        let tb = it.title_height();
+        if tb > 0.0 {
+            let h = it.half();
+            let to_screen = |x: f32, y: f32| self.w2s(it.center + rotate(vec2(x, y), it.rotation));
+            let bar = vec![
+                card[0],
+                card[1],
+                to_screen(h.x, -h.y),
+                to_screen(-h.x, -h.y),
+            ];
+            painter.add(Shape::convex_polygon(bar, tag, Stroke::NONE));
+            // Font sizes are stepped so zooming doesn't fill the font atlas with every size.
+            let size = tb * 0.6 * self.zoom;
+            let size = (2f32.powf((size.log2() * 6.0).round() / 6.0)).min(96.0);
+            if size >= 5.0 {
+                let lum = tag.r() as u32 * 3 + tag.g() as u32 * 6 + tag.b() as u32;
+                let ink = if lum > 1500 { Color32::BLACK } else { Color32::WHITE };
+                let pad = tb * 0.3;
+                let mut job = LayoutJob::single_section(
+                    it.title.clone(),
+                    TextFormat::simple(FontId::proportional(size), ink),
+                );
+                job.wrap = TextWrapping {
+                    max_width: ((h.x * 2.0 - pad * 2.0) * self.zoom).max(1.0),
+                    max_rows: 1,
+                    break_anywhere: true,
+                    overflow_character: Some('…'),
+                };
+                let galley = painter.layout_job(job);
+                let text_h = galley.size().y / self.zoom;
+                let top_left = to_screen(-h.x + pad, -h.y - tb + (tb - text_h) * 0.5);
+                painter.add(TextShape::new(top_left, galley, ink).with_angle(it.rotation));
+            }
+        }
+        painter.add(Shape::closed_line(card, Stroke::new(1.5, tag)));
+    }
+
+    fn draw_links(&self, painter: &egui::Painter) {
+        for (i, a, b) in self.link_lines() {
+            let l = &self.links[i];
+            let (a, b) = (self.w2s(a), self.w2s(b));
+            if l.selected {
+                draw_link(painter, a, b, l.arrow, LINK_PX + 4.0, ACCENT.gamma_multiply(0.6));
+            }
+            draw_link(painter, a, b, l.arrow, LINK_PX, l.color);
         }
     }
 
@@ -2167,7 +2430,7 @@ impl App {
             let c: Vec<Pos2> = it.corners().iter().map(|c| self.w2s(*c)).collect();
             painter.add(Shape::closed_line(c, outline));
         }
-        if count == 0 || !matches!(self.tool, Tool::Select | Tool::Note) {
+        if count == 0 || self.tool != Tool::Select {
             return;
         }
         let Some(frame) = self.selection_frame() else {
@@ -2202,13 +2465,33 @@ impl App {
                     painter.rect_stroke(r, 0.0, Stroke::new(1.0, ACCENT), StrokeKind::Inside);
                 }
             }
-            Drag::Draw { points } => {
-                // Preview through the gap-filling spline so the live line is already smooth.
-                let pts = smooth::densify(points, 1.0 / self.zoom)
+            Drag::Link { from, at } => {
+                // Rubber-band line from the source card to the pointer, or to the target's edge.
+                if let Some(src) = self.item_by_id(*from) {
+                    let target = self.hit_item(*at).map(|i| &self.items[i]).filter(|t| t.id != *from);
+                    let ends = match target {
+                        Some(t) => {
+                            let c: Vec<Pos2> = t.card_corners().iter().map(|p| self.w2s(*p)).collect();
+                            painter.add(Shape::closed_line(c, Stroke::new(2.0, ACCENT)));
+                            link_ends(src, t)
+                        }
+                        None => src.edge_toward(*at).map(|e| (e, *at)),
+                    };
+                    if let Some((a, b)) = ends {
+                        draw_link(painter, self.w2s(a), self.w2s(b), true, LINK_PX, self.pen_color);
+                    }
+                }
+            }
+            Drag::Draw {
+                points, snapped, ..
+            } => {
+                // Preview freehand parts through the gap-filling spline so the live line is
+                // already smooth; grid-snapped parts stay straight.
+                let pts = smooth::finish_mixed(points, snapped, 0.0, 1.0 / self.zoom)
                     .into_iter()
                     .map(|p| self.w2s(p))
                     .collect();
-                draw_polyline(painter, pts, self.pen_width, self.pen_color);
+                draw_polyline(painter, pts, (self.pen_width * self.zoom).max(0.75), self.pen_color);
             }
             _ => {}
         }
@@ -2225,7 +2508,7 @@ impl App {
                 Tool::Pen if matches!(self.drag, Drag::None) => {
                     painter.circle_stroke(
                         p,
-                        self.pen_width * 0.5 + 1.0,
+                        self.pen_width * self.zoom * 0.5 + 1.0,
                         Stroke::new(1.0, self.pen_color.gamma_multiply(0.8)),
                     );
                 }
@@ -2239,7 +2522,7 @@ impl App {
                 rect.center(),
                 Align2::CENTER_CENTER,
                 "Drop images or PDFs here, or paste with Ctrl+V\n\
-                 B: pen   E: eraser   T: note   F1: all shortcuts\n\
+                 B: pen   E: eraser   C: crop   F1: all shortcuts\n\
                  Right-click for menu",
                 FontId::proportional(18.0),
                 dim,
@@ -2253,8 +2536,7 @@ impl App {
 
     fn context_menu(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.set_min_width(200.0);
-        let has_sel = self.any_selected();
-        let at = self.menu_pos;
+        let has_sel = self.any_selected() || self.any_link_selected();
 
         if ui.button("Paste\tCtrl+V").clicked() {
             self.paste(ctx, None);
@@ -2263,10 +2545,6 @@ impl App {
         if ui.button("Import images / PDF…\tCtrl+I").clicked() {
             ui.close();
             self.import_dialog(ctx);
-        }
-        if ui.button("Add note here\tT").clicked() {
-            self.create_note(at);
-            ui.close();
         }
         ui.separator();
         ui.add_enabled_ui(has_sel, |ui| {
@@ -2296,6 +2574,45 @@ impl App {
             {
                 self.start_crop(ctx);
                 ui.close();
+            }
+            if ui
+                .add_enabled(
+                    self.single_selected_image().is_some(),
+                    egui::Button::new("Title…\tT"),
+                )
+                .clicked()
+            {
+                self.title_selected(ctx);
+                ui.close();
+            }
+            ui.add_enabled_ui(self.has_selected_image(), |ui| {
+                ui.menu_button("Label colour", |ui| {
+                    ui.horizontal(|ui| {
+                        for c in TAG_COLORS {
+                            let on = self.selected().all(|it| it.is_stroke() || it.tag == Some(c));
+                            if swatch(ui, c, on).clicked() {
+                                self.set_tag(Some(c));
+                                ui.close();
+                            }
+                        }
+                    });
+                    if ui.button("No label").clicked() {
+                        self.set_tag(None);
+                        ui.close();
+                    }
+                });
+            });
+            if self.any_link_selected() {
+                ui.separator();
+                if ui.button("Reverse link direction").clicked() {
+                    self.reverse_links();
+                    ui.close();
+                }
+                let mut arrow = self.links.iter().filter(|l| l.selected).all(|l| l.arrow);
+                if ui.checkbox(&mut arrow, "Arrowhead").clicked() {
+                    self.set_link_arrows(arrow);
+                }
+                ui.separator();
             }
             ui.menu_button("Transform", |ui| {
                 if ui.button("Flip horizontal\tH").clicked() {
@@ -2381,54 +2698,6 @@ impl App {
 
     // ------------------------------------------------------------------ panels
 
-    fn note_editor(&mut self, ctx: &egui::Context) {
-        let Some(id) = self.editing else {
-            return;
-        };
-        let Some(idx) = self.items.iter().position(|i| i.id == id) else {
-            self.editing = None;
-            return;
-        };
-        let focus_now = std::mem::take(&mut self.edit_focus_pending);
-        let zoom = self.zoom;
-        let it = &self.items[idx];
-        let pos = self.w2s(it.center - it.half() + Vec2::splat(NOTE_PAD * it.scale));
-        let (scale, width) = (it.scale, it.size.x);
-        let Some(n) = self.items[idx].note_mut() else {
-            return;
-        };
-        let fs = (n.font_size * scale * zoom).clamp(4.0, 400.0);
-        let wrap = ((width - 2.0 * NOTE_PAD) * scale * zoom).max(10.0);
-        let fg = n.fg;
-        let mut done = false;
-        egui::Area::new(Id::new("note_editor"))
-            .order(Order::Foreground)
-            .fixed_pos(pos)
-            .constrain(false)
-            .show(ctx, |ui| {
-                ui.visuals_mut().text_cursor.stroke.color = fg;
-                let r = ui.add(
-                    egui::TextEdit::multiline(&mut n.text)
-                        .font(FontId::proportional(fs))
-                        .text_color(fg)
-                        .desired_width(wrap)
-                        .desired_rows(1)
-                        .frame(false)
-                        .margin(Margin::ZERO)
-                        .hint_text("Type a note…"),
-                );
-                if focus_now {
-                    r.request_focus();
-                }
-                if r.lost_focus() {
-                    done = true;
-                }
-            });
-        if done {
-            self.finish_editing();
-        }
-    }
-
     fn toolbar(&mut self, ctx: &egui::Context) {
         egui::Area::new(Id::new("toolbar"))
             .anchor(Align2::LEFT_TOP, vec2(10.0, 10.0))
@@ -2439,8 +2708,8 @@ impl App {
                         for (tool, label, tip) in [
                             (Tool::Select, "Select", "Select / move / scale / rotate  (S)"),
                             (Tool::Pen, "Pen", "Freehand sketching  (B)"),
-                            (Tool::Eraser, "Eraser", "Erase strokes  (E)"),
-                            (Tool::Note, "Note", "Click to place a text note  (T)"),
+                            (Tool::Eraser, "Eraser", "Erase strokes and links  (E)"),
+                            (Tool::Link, "Link", "Connect items: drag from one to another  (L)"),
                         ] {
                             if ui
                                 .selectable_label(self.tool == tool && self.cropping.is_none(), label)
@@ -2464,9 +2733,11 @@ impl App {
                             self.toggle_crop(ctx);
                         }
                         ui.separator();
+                        self.grid_controls(ui);
+                        ui.separator();
                         for c in INK_COLORS {
                             if swatch(ui, c, c == self.pen_color)
-                                .on_hover_text("Ink colour (recolours selected strokes)")
+                                .on_hover_text("Ink colour (recolours selected strokes and links)")
                                 .clicked()
                             {
                                 self.pen_color = c;
@@ -2482,9 +2753,13 @@ impl App {
                             );
                         } else {
                             ui.add(
-                                egui::Slider::new(&mut self.pen_width, 1.0..=60.0)
+                                egui::Slider::new(&mut self.pen_width, 0.5..=200.0)
                                     .logarithmic(true)
                                     .text("width"),
+                            )
+                            .on_hover_text(
+                                "Pen width in board pixels (equal to screen pixels at 100% zoom).\n\
+                                 Strokes keep this size relative to images at any zoom.",
                             );
                             if self.tool == Tool::Pen {
                                 ui.add(
@@ -2502,19 +2777,36 @@ impl App {
                                 );
                             }
                         }
-                        ui.separator();
-                        for (i, (bg, _)) in NOTE_COLORS.iter().enumerate() {
-                            if swatch(ui, *bg, i == self.note_style)
-                                .on_hover_text("Note colour (restyles selected notes)")
-                                .clicked()
-                            {
-                                self.note_style = i;
-                                self.restyle_notes(i);
-                            }
-                        }
                     });
                 });
             });
+    }
+
+    fn grid_controls(&mut self, ui: &mut egui::Ui) {
+        ui.toggle_value(&mut self.grid, "Grid")
+            .on_hover_text("Show dot grid  (G)\nHold Shift while dragging to snap");
+        let mut size = self.grid_size;
+        egui::ComboBox::from_id_salt("grid-size")
+            .selected_text(format!("{} px", fmt_grid(size)))
+            .width(70.0)
+            .show_ui(ui, |ui| {
+                for g in GRID_PRESETS {
+                    ui.selectable_value(&mut size, g, format!("{} px", fmt_grid(g)));
+                }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("Custom:");
+                    ui.add(
+                        egui::DragValue::new(&mut size)
+                            .range(1.0..=2000.0)
+                            .speed(0.5)
+                            .suffix(" px"),
+                    );
+                });
+            })
+            .response
+            .on_hover_text("Grid spacing  (N / Shift+N)");
+        self.set_grid_size(size);
     }
 
     fn hud(&mut self, ctx: &egui::Context) {
@@ -2523,8 +2815,16 @@ impl App {
             self.status = None;
         }
         let mut parts = vec![format!("{:.0}%", self.zoom * 100.0)];
+        let snapping = ctx.input(|i| i.modifiers.shift) && !matches!(self.drag, Drag::None);
+        if self.grid || snapping {
+            let snap_note = if snapping { " (snapping)" } else { "" };
+            parts.push(format!("grid {} px{snap_note}", fmt_grid(self.grid_size)));
+        }
         if !self.items.is_empty() {
             parts.push(format!("{} items", self.items.len()));
+        }
+        if !self.links.is_empty() {
+            parts.push(format!("{} links", self.links.len()));
         }
         if self.loading > 0 {
             parts.push("loading…".into());
@@ -2551,14 +2851,53 @@ impl App {
             });
     }
 
+    /// Inline text field over the title bar of the image being titled.
+    fn title_editor(&mut self, ctx: &egui::Context) {
+        let Some(id) = self.title_edit.as_ref().map(|e| e.id) else {
+            return;
+        };
+        let Some(it) = self.item_by_id(id) else {
+            self.title_edit = None;
+            return;
+        };
+        let h = it.half();
+        let tb = it.title_bar_height();
+        let top_left = self.w2s(it.center + rotate(vec2(-h.x, -h.y - tb), it.rotation));
+        let width = (h.x * 2.0 * self.zoom).clamp(160.0, 520.0);
+        let font = (tb * 0.6 * self.zoom).clamp(13.0, 28.0);
+        let edit = self.title_edit.as_mut().unwrap();
+        // Some(true): apply, Some(false): cancel.
+        let mut done = None;
+        egui::Area::new(Id::new("title-edit"))
+            .fixed_pos(top_left)
+            .order(Order::Foreground)
+            .show(ctx, |ui| {
+                let r = ui.add(
+                    egui::TextEdit::singleline(&mut edit.text)
+                        .desired_width(width)
+                        .font(FontId::proportional(font))
+                        .hint_text("Title (Enter to apply, Esc to cancel)"),
+                );
+                if std::mem::take(&mut edit.focus) {
+                    r.request_focus();
+                } else if r.lost_focus() {
+                    done = Some(!ui.input(|i| i.key_pressed(Key::Escape)));
+                }
+            });
+        match done {
+            Some(true) => self.commit_title(),
+            Some(false) => self.title_edit = None,
+            None => {}
+        }
+    }
+
     fn help_window(&mut self, ctx: &egui::Context) {
         const ROWS: &[(&str, &str)] = &[
             ("Pan", "Middle / right drag, or Space + drag"),
             ("Zoom", "Scroll wheel, Ctrl +/-, Ctrl+0 = 100%"),
             ("Fit all / selection", "F, or double-click empty space"),
             ("Select tool", "S or V"),
-            ("Pen / Eraser", "B / E   ( [ and ] change size )"),
-            ("Note", "T, then click; double-click a note to edit"),
+            ("Pen / Eraser", "B / E   ( [ and ] change size; Shift: 0/45/90° lines on the grid )"),
             ("Select", "Click, Shift+click, drag a box"),
             ("Scale", "Drag a corner handle"),
             ("Rotate", "Drag just outside a corner (Shift snaps 15°)"),
@@ -2573,7 +2912,11 @@ impl App {
             ("New / Open / Save", "Ctrl+N / Ctrl+O / Ctrl+S"),
             ("Import images / PDF pages", "Ctrl+I (or drag & drop)"),
             ("Always on top", "Ctrl+Shift+T"),
-            ("Grid / Toolbar", "G / Tab"),
+            ("Grid", "G show · N / Shift+N spacing · hold Shift while dragging to snap"),
+            ("Title an image", "T or F2, or double-click its title bar · right-click → Label colour"),
+            ("Link items", "L, then drag from one item to another · click a link to select it, Del removes"),
+            ("Snap while moving", "Shift: a stroke's points (or an image's corner) land on the grid"),
+            ("Toolbar", "Tab"),
         ];
         egui::Window::new("Shortcuts")
             .open(&mut self.show_help)
@@ -2671,12 +3014,12 @@ impl eframe::App for App {
             .frame(egui::Frame::NONE.fill(self.background))
             .show(ctx, |ui| self.canvas(ui));
 
-        self.note_editor(ctx);
         if self.show_toolbar {
             self.toolbar(ctx);
         }
         self.pdf_dialog(ctx);
         self.hud(ctx);
+        self.title_editor(ctx);
         if self.show_help {
             self.help_window(ctx);
         }
@@ -2695,18 +3038,50 @@ fn draw_polyline(painter: &egui::Painter, pts: Vec<Pos2>, width: f32, color: Col
         painter.circle_filled(first, width * 0.5, color);
         return;
     }
-    // Round caps (and joins, for thick lines) so strokes look like ink.
+    // egui joins thick line segments with miters, which stick out as square or chopped-off
+    // points at sharp turns. So split the stroke at sharp corners, draw each smooth run as its
+    // own line (gentle turns make invisible miters), and put a round dot on each corner and end.
+    const SHARP_COS: f32 = 0.9; // turns sharper than ~25°
+    let round = width > 2.0;
+    let stroke = Stroke::new(width, color);
+    let mut start = 0;
+    for i in 1..pts.len() - 1 {
+        let (d1, d2) = (pts[i] - pts[i - 1], pts[i + 1] - pts[i]);
+        if d1.length_sq() == 0.0 || d2.length_sq() == 0.0 {
+            continue;
+        }
+        if d1.normalized().dot(d2.normalized()) < SHARP_COS {
+            painter.add(Shape::line(pts[start..=i].to_vec(), stroke));
+            if round {
+                painter.circle_filled(pts[i], width * 0.5, color);
+            }
+            start = i;
+        }
+    }
     let last = *pts.last().unwrap();
-    if width > 2.0 {
+    painter.add(Shape::line(pts[start..].to_vec(), stroke));
+    if round {
         painter.circle_filled(first, width * 0.5, color);
         painter.circle_filled(last, width * 0.5, color);
     }
-    if width > 6.0 {
-        for p in &pts[1..pts.len() - 1] {
-            painter.circle_filled(*p, width * 0.5, color);
-        }
+}
+
+/// A link line from `a` to `b` (screen), with an optional arrowhead at `b`.
+fn draw_link(painter: &egui::Painter, a: Pos2, b: Pos2, arrow: bool, width: f32, color: Color32) {
+    let d = b - a;
+    let len = d.length();
+    if len < 1.0 {
+        return;
     }
-    painter.add(Shape::line(pts, Stroke::new(width, color)));
+    let dir = d / len;
+    let head = (ARROW_PX + width * 0.5).min(len * 0.5);
+    let end = if arrow { b - dir * head * 0.8 } else { b };
+    painter.line_segment([a, end], Stroke::new(width, color));
+    if arrow {
+        let side = dir.rot90() * head * 0.45;
+        let back = b - dir * head;
+        painter.add(Shape::convex_polygon(vec![b, back + side, back - side], color, Stroke::NONE));
+    }
 }
 
 fn swatch(ui: &mut egui::Ui, c: Color32, selected: bool) -> egui::Response {
@@ -2725,6 +3100,19 @@ fn swatch(ui: &mut egui::Ui, c: Color32, selected: bool) -> egui::Response {
         p.rect_stroke(rect, 4.0, Stroke::new(1.0, Color32::from_gray(200)), StrokeKind::Inside);
     }
     resp
+}
+
+/// Nearest grid point.
+fn snap(p: Pos2, grid: f32) -> Pos2 {
+    pos2((p.x / grid).round() * grid, (p.y / grid).round() * grid)
+}
+
+fn fmt_grid(g: f32) -> String {
+    if g.fract() == 0.0 {
+        format!("{g:.0}")
+    } else {
+        format!("{g:.1}")
+    }
 }
 
 fn color(c: [u8; 4]) -> Color32 {
@@ -2756,4 +3144,28 @@ fn percent_decode(s: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snaps_to_nearest_grid_point() {
+        assert_eq!(snap(pos2(14.0, -17.0), 10.0), pos2(10.0, -20.0));
+        assert_eq!(snap(pos2(33.0, 47.0), 32.0), pos2(32.0, 32.0));
+        assert_eq!(snap(pos2(2.5, 7.4), 2.5), pos2(2.5, 7.5));
+    }
+
+    #[test]
+    fn grid_labels() {
+        assert_eq!(fmt_grid(32.0), "32");
+        assert_eq!(fmt_grid(2.5), "2.5");
+    }
+
+    #[test]
+    fn presets_are_sorted_and_include_default() {
+        assert!(GRID_PRESETS.windows(2).all(|w| w[0] < w[1]));
+        assert!(GRID_PRESETS.contains(&DEFAULT_GRID));
+    }
 }
