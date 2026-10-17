@@ -50,8 +50,9 @@ pub enum LoadMsg {
     Error(String),
 }
 
-pub fn decode(bytes: Vec<u8>, max_side: usize) -> Result<Decoded, String> {
-    let reader = ImageReader::new(Cursor::new(&bytes))
+/// Decode an encoded image at full resolution, honouring EXIF orientation.
+pub fn decode_dynamic(bytes: &[u8]) -> Result<DynamicImage, String> {
+    let reader = ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|e| e.to_string())?;
     let mut decoder = reader.into_decoder().map_err(|e| e.to_string())?;
@@ -60,6 +61,11 @@ pub fn decode(bytes: Vec<u8>, max_side: usize) -> Result<Decoded, String> {
     if let Some(o) = orientation {
         img.apply_orientation(o);
     }
+    Ok(img)
+}
+
+pub fn decode(bytes: Vec<u8>, max_side: usize) -> Result<Decoded, String> {
+    let mut img = decode_dynamic(&bytes)?;
     let orig_size = [img.width() as usize, img.height() as usize];
     let max_side = max_side.max(256) as u32;
     if img.width() > max_side || img.height() > max_side {

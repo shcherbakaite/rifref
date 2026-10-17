@@ -11,17 +11,20 @@ use eframe::egui::{
 
 use crate::item::{
     polyline_distance, rotate, segment_distance, stroke_geometry, Content, Frame as SelFrame,
-    ImageAsset, Item, Note, StrokeData, NOTE_DEFAULT_FONT, NOTE_DEFAULT_WIDTH, NOTE_PAD,
+    ImageAsset, Item, Note, StrokeData, FULL_CROP, NOTE_DEFAULT_FONT, NOTE_DEFAULT_WIDTH, NOTE_PAD,
 };
 use crate::loader::{self, Decoded, Layout, LoadMsg};
 use crate::pdf;
 use crate::scene::{self, SavedItem, SavedKind, SceneFile};
+use crate::smooth;
 
 const HANDLE_PX: f32 = 9.0;
 const ROTATE_PX: f32 = 28.0;
 const MIN_ZOOM: f32 = 0.005;
 const MAX_ZOOM: f32 = 100.0;
 const UNDO_LIMIT: usize = 200;
+/// Smallest crop, in source pixels.
+const MIN_CROP_PX: f32 = 4.0;
 const ACCENT: Color32 = Color32::from_rgb(80, 160, 255);
 /// eframe storage key holding the path of the board that was open on exit.
 const LAST_BOARD_KEY: &str = "last_board";
@@ -70,8 +73,31 @@ enum Handle {
     Rotate,
 }
 
+/// A crop handle: which image edges it moves, or `Slide` to move the picture inside the frame.
+#[derive(Clone, Copy)]
+enum CropGrip {
+    Edges {
+        left: bool,
+        top: bool,
+        right: bool,
+        bottom: bool,
+    },
+    Slide,
+}
+
+/// An image being cropped, with its state before cropping started (for cancel).
+struct CropState {
+    id: u64,
+    orig: Item,
+}
+
 enum Drag {
     None,
+    Crop {
+        grip: CropGrip,
+        orig: Item,
+        start_px: Pos2,
+    },
     Pan {
         last: Pos2,
     },
@@ -96,6 +122,7 @@ enum Drag {
         base: Vec<u64>,
     },
     Draw {
+        /// Raw pointer samples (world).
         points: Vec<Pos2>,
     },
     Erase {
@@ -140,12 +167,16 @@ pub struct App {
 
     pen_color: Color32,
     pen_width: f32,
+    /// Stroke smoothing strength, 0..=1.
+    smoothing: f32,
     eraser_radius: f32,
     note_style: usize,
 
     editing: Option<u64>,
     edit_original: Option<String>,
     edit_focus_pending: bool,
+
+    cropping: Option<CropState>,
 
     background: Color32,
     grid: bool,
@@ -189,11 +220,13 @@ impl App {
             paste_via_event: false,
             pen_color: INK_COLORS[0],
             pen_width: 4.0,
+            smoothing: 0.5,
             eraser_radius: 16.0,
             note_style: 0,
             editing: None,
             edit_original: None,
             edit_focus_pending: false,
+            cropping: None,
             background: BACKGROUNDS[0].1,
             grid: false,
             always_on_top: false,
@@ -312,12 +345,21 @@ impl App {
         })
     }
 
+    /// Topmost item under `w`. Strokes form the top layer, so they are tested first.
     fn hit_item(&self, w: Pos2) -> Option<usize> {
         let tol = 5.0 / self.zoom;
-        self.items.iter().rposition(|it| it.hit(w, tol))
+        let hit = |strokes: bool| {
+            self.items
+                .iter()
+                .rposition(|it| it.is_stroke() == strokes && it.hit(w, tol))
+        };
+        hit(true).or_else(|| hit(false))
     }
 
     fn hit_handle(&self, screen: Pos2, mods: Modifiers) -> Option<Handle> {
+        if self.cropping.is_some() {
+            return None;
+        }
         let f = self.selection_frame()?;
         let corners = f.corners().map(|c| self.w2s(c));
         for (i, c) in corners.iter().enumerate() {
@@ -352,6 +394,7 @@ impl App {
 
     fn undo(&mut self) {
         self.finish_editing();
+        self.finish_crop();
         if let Some(prev) = self.undo.pop() {
             self.redo.push(std::mem::replace(&mut self.items, prev));
             self.dirty = true;
@@ -360,6 +403,7 @@ impl App {
 
     fn redo(&mut self) {
         self.finish_editing();
+        self.finish_crop();
         if let Some(next) = self.redo.pop() {
             self.undo.push(std::mem::replace(&mut self.items, next));
             self.dirty = true;
@@ -529,6 +573,7 @@ impl App {
 
     fn clear_scene(&mut self) {
         self.finish_editing();
+        self.cropping = None;
         self.items.clear();
         self.undo.clear();
         self.redo.clear();
@@ -552,7 +597,11 @@ impl App {
                     let idx = *image_index
                         .entry(Arc::as_ptr(a))
                         .or_insert_with(|| scene.add_image(&a.bytes));
-                    SavedKind::Image { image: idx }
+                    let c = it.crop;
+                    SavedKind::Image {
+                        image: idx,
+                        crop: (c != FULL_CROP).then_some([c.min.x, c.min.y, c.max.x, c.max.y]),
+                    }
                 }
                 Content::Note(n) => SavedKind::Note {
                     text: n.text.clone(),
@@ -595,10 +644,15 @@ impl App {
         let mut missing = 0;
         for s in scene.items {
             let center = pos2(s.center[0], s.center[1]);
+            let mut crop_rect = FULL_CROP;
             let (content, size) = match s.kind {
-                SavedKind::Image { image } => match assets.get(image).cloned().flatten() {
+                SavedKind::Image { image, crop } => match assets.get(image).cloned().flatten() {
                     Some(a) => {
-                        let size = a.size;
+                        if let Some([x0, y0, x1, y1]) = crop {
+                            crop_rect = Rect::from_min_max(pos2(x0, y0), pos2(x1, y1))
+                                .intersect(FULL_CROP);
+                        }
+                        let size = a.size * crop_rect.size();
                         (Content::Image(a), size)
                     }
                     None => {
@@ -641,6 +695,7 @@ impl App {
             it.rotation = s.rotation;
             it.flip_x = s.flip_x;
             it.flip_y = s.flip_y;
+            it.crop = crop_rect;
             self.items.push(it);
         }
         self.background = color(scene.background);
@@ -665,6 +720,7 @@ impl App {
     /// Returns true if the board was saved.
     fn save_board(&mut self, ctx: &egui::Context, save_as: bool) -> bool {
         self.finish_editing();
+        self.finish_crop();
         let path = if save_as || self.path.is_none() {
             rfd::FileDialog::new()
                 .add_filter("RifRef board", &[scene::EXTENSION])
@@ -917,7 +973,194 @@ impl App {
 
     fn set_tool(&mut self, tool: Tool) {
         self.finish_editing();
+        self.finish_crop();
         self.tool = tool;
+    }
+
+    // ------------------------------------------------------------------- crop
+
+    fn single_selected_image(&self) -> Option<usize> {
+        let mut sel = (0..self.items.len()).filter(|&i| self.items[i].selected);
+        let i = sel.next()?;
+        (sel.next().is_none() && matches!(self.items[i].content, Content::Image(_))).then_some(i)
+    }
+
+    /// Index and source size of the image being cropped.
+    fn crop_target(&self) -> Option<(usize, Vec2)> {
+        let id = self.cropping.as_ref()?.id;
+        let idx = self.items.iter().position(|i| i.id == id)?;
+        match &self.items[idx].content {
+            Content::Image(a) => Some((idx, a.size)),
+            _ => None,
+        }
+    }
+
+    fn start_crop(&mut self, ctx: &egui::Context) {
+        let Some(idx) = self.single_selected_image() else {
+            self.set_status(ctx, "Select a single image to crop");
+            return;
+        };
+        self.finish_editing();
+        self.tool = Tool::Select;
+        self.push_undo();
+        self.cropping = Some(CropState {
+            id: self.items[idx].id,
+            orig: self.items[idx].clone(),
+        });
+    }
+
+    fn finish_crop(&mut self) {
+        let Some(state) = self.cropping.take() else {
+            return;
+        };
+        let unchanged = self
+            .items
+            .iter()
+            .find(|i| i.id == state.id)
+            .is_none_or(|i| i.crop == state.orig.crop && i.center == state.orig.center);
+        if unchanged {
+            self.undo.pop();
+        }
+    }
+
+    fn cancel_crop(&mut self) {
+        let Some(state) = self.cropping.take() else {
+            return;
+        };
+        if let Some(it) = self.items.iter_mut().find(|i| i.id == state.id) {
+            it.center = state.orig.center;
+            it.size = state.orig.size;
+            it.crop = state.orig.crop;
+        }
+        self.undo.pop();
+    }
+
+    fn toggle_crop(&mut self, ctx: &egui::Context) {
+        if self.cropping.is_some() {
+            self.finish_crop();
+        } else {
+            self.start_crop(ctx);
+        }
+    }
+
+    fn reset_crop(&mut self) {
+        self.finish_crop();
+        let targets: Vec<usize> = (0..self.items.len())
+            .filter(|&i| {
+                let it = &self.items[i];
+                it.selected && it.crop != FULL_CROP && matches!(it.content, Content::Image(_))
+            })
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        self.push_undo();
+        for i in targets {
+            if let Content::Image(a) = &self.items[i].content {
+                let full = a.size;
+                let orig = self.items[i].clone();
+                self.items[i].set_crop_px(&orig, full, Rect::from_min_size(Pos2::ZERO, full), true);
+            }
+        }
+    }
+
+    /// Screen positions of the eight crop handles.
+    fn crop_grips(&self) -> Vec<(Pos2, CropGrip)> {
+        let Some((idx, full)) = self.crop_target() else {
+            return Vec::new();
+        };
+        let it = &self.items[idx];
+        let r = it.crop_px(full);
+        [
+            (0.0, 0.0),
+            (0.5, 0.0),
+            (1.0, 0.0),
+            (1.0, 0.5),
+            (1.0, 1.0),
+            (0.5, 1.0),
+            (0.0, 1.0),
+            (0.0, 0.5),
+        ]
+        .into_iter()
+        .map(|(fx, fy): (f32, f32)| {
+            let px = pos2(
+                r.min.x + r.width() * fx,
+                r.min.y + r.height() * fy,
+            );
+            let grip = CropGrip::Edges {
+                left: fx == 0.0,
+                top: fy == 0.0,
+                right: fx == 1.0,
+                bottom: fy == 1.0,
+            };
+            (self.w2s(it.px_to_world(full, px)), grip)
+        })
+        .collect()
+    }
+
+    fn hit_crop(&self, screen: Pos2) -> Option<CropGrip> {
+        if let Some((_, grip)) = self
+            .crop_grips()
+            .into_iter()
+            .find(|(p, _)| p.distance(screen) <= HANDLE_PX + 2.0)
+        {
+            return Some(grip);
+        }
+        let (idx, full) = self.crop_target()?;
+        let px = self.items[idx].world_to_px(full, self.s2w(screen));
+        Rect::from_min_size(Pos2::ZERO, full)
+            .contains(px)
+            .then_some(CropGrip::Slide)
+    }
+
+    fn drag_crop(&mut self, grip: CropGrip, orig: &Item, start_px: Pos2, w: Pos2) {
+        let Some((idx, full)) = self.crop_target() else {
+            return;
+        };
+        let px = orig.world_to_px(full, w);
+        let r0 = orig.crop_px(full);
+        let min = MIN_CROP_PX.min(full.x).min(full.y);
+        match grip {
+            CropGrip::Edges {
+                left,
+                top,
+                right,
+                bottom,
+            } => {
+                let mut r = r0;
+                if left {
+                    r.min.x = px.x.clamp(0.0, r.max.x - min);
+                }
+                if right {
+                    r.max.x = px.x.clamp(r.min.x + min, full.x);
+                }
+                if top {
+                    r.min.y = px.y.clamp(0.0, r.max.y - min);
+                }
+                if bottom {
+                    r.max.y = px.y.clamp(r.min.y + min, full.y);
+                }
+                self.items[idx].set_crop_px(orig, full, r, true);
+            }
+            CropGrip::Slide => {
+                // Move the picture with the pointer: the visible window moves the other way.
+                let r = r0.translate(start_px - px);
+                let shift = |lo: f32, hi: f32, max: f32| {
+                    if lo < 0.0 {
+                        -lo
+                    } else if hi > max {
+                        max - hi
+                    } else {
+                        0.0
+                    }
+                };
+                let r = r.translate(vec2(
+                    shift(r.min.x, r.max.x, full.x),
+                    shift(r.min.y, r.max.y, full.y),
+                ));
+                self.items[idx].set_crop_px(orig, full, r, false);
+            }
+        }
     }
 
     // ------------------------------------------------------------------ notes
@@ -1152,11 +1395,23 @@ impl App {
         else {
             return false;
         };
+        let crop = it.crop;
         let result = match &it.content {
-            Content::Image(a) => image::load_from_memory(&a.bytes)
-                .map_err(|e| e.to_string())
+            Content::Image(a) => loader::decode_dynamic(&a.bytes)
                 .and_then(|img| {
-                    let rgba = img.to_rgba8();
+                    let (w, h) = (img.width() as f32, img.height() as f32);
+                    let px = Rect::from_min_max(
+                        pos2(crop.min.x * w, crop.min.y * h),
+                        pos2(crop.max.x * w, crop.max.y * h),
+                    );
+                    let rgba = img
+                        .crop_imm(
+                            px.min.x.round() as u32,
+                            px.min.y.round() as u32,
+                            (px.width().round() as u32).max(1),
+                            (px.height().round() as u32).max(1),
+                        )
+                        .to_rgba8();
                     let data = arboard::ImageData {
                         width: rgba.width() as usize,
                         height: rgba.height() as usize,
@@ -1246,6 +1501,16 @@ impl App {
         let cmd = Modifiers::COMMAND;
         let cmd_shift = Modifiers::COMMAND | Modifiers::SHIFT;
         let none = Modifiers::NONE;
+
+        if self.cropping.is_some() {
+            if k(none, Key::Escape) {
+                self.cancel_crop();
+            } else if k(none, Key::Enter) || k(none, Key::C) {
+                self.finish_crop();
+            }
+        } else if k(none, Key::C) {
+            self.start_crop(ctx);
+        }
 
         if k(cmd_shift, Key::Z) || k(cmd, Key::Y) {
             self.redo();
@@ -1362,6 +1627,20 @@ impl App {
 
     fn begin_primary_drag(&mut self, origin: Pos2, mods: Modifiers) {
         let w = self.s2w(origin);
+        if self.cropping.is_some() {
+            if let (Some(grip), Some((idx, full))) = (self.hit_crop(origin), self.crop_target()) {
+                let orig = self.items[idx].clone();
+                let start_px = orig.world_to_px(full, w);
+                self.drag = Drag::Crop {
+                    grip,
+                    orig,
+                    start_px,
+                };
+                return;
+            }
+            // Dragging anywhere else applies the crop and behaves as usual.
+            self.finish_crop();
+        }
         match self.tool {
             Tool::Pen => self.drag = Drag::Draw { points: vec![w] },
             Tool::Eraser => {
@@ -1420,8 +1699,18 @@ impl App {
     fn continue_drag(&mut self, pos: Pos2, mods: Modifiers) {
         let w = self.s2w(pos);
         let zoom = self.zoom;
+        if let Drag::Crop {
+            grip,
+            orig,
+            start_px,
+        } = &self.drag
+        {
+            let (grip, orig, start_px) = (*grip, orig.clone(), *start_px);
+            self.drag_crop(grip, &orig, start_px, w);
+            return;
+        }
         match &mut self.drag {
-            Drag::None => {}
+            Drag::None | Drag::Crop { .. } => {}
             Drag::Pan { last } => {
                 self.pan += pos - *last;
                 *last = pos;
@@ -1471,7 +1760,7 @@ impl App {
                 }
             }
             Drag::Draw { points } => {
-                if points.last().is_none_or(|l| l.distance(w) * zoom >= 1.5) {
+                if points.last().is_none_or(|l| l.distance(w) * zoom >= 1.0) {
                     points.push(w);
                 }
             }
@@ -1485,7 +1774,10 @@ impl App {
 
     fn end_drag(&mut self) {
         match std::mem::replace(&mut self.drag, Drag::None) {
-            Drag::Draw { points } => self.commit_stroke(points),
+            Drag::Draw { points } => {
+                let points = smooth::finish_stroke(&points, self.smoothing, 1.0 / self.zoom);
+                self.commit_stroke(points);
+            }
             Drag::Erase { changed: false } => {
                 self.undo.pop();
             }
@@ -1494,6 +1786,12 @@ impl App {
     }
 
     fn click(&mut self, w: Pos2, mods: Modifiers) {
+        if self.cropping.is_some() {
+            if self.hit_crop(self.w2s(w)).is_some() {
+                return;
+            }
+            self.finish_crop();
+        }
         match self.tool {
             Tool::Select => match self.hit_item(w) {
                 Some(i) if mods.shift || mods.command => {
@@ -1527,6 +1825,10 @@ impl App {
     }
 
     fn double_click(&mut self, w: Pos2) {
+        if self.cropping.is_some() {
+            self.finish_crop();
+            return;
+        }
         match self.hit_item(w) {
             Some(i) if self.items[i].is_note() => self.start_editing(i),
             Some(i) => {
@@ -1591,7 +1893,24 @@ impl App {
             }
         }
         if resp.dragged() {
-            if let Some(p) = pointer {
+            if matches!(self.drag, Drag::Draw { .. }) {
+                // Use every pointer sample, not just one per frame, so fast strokes keep their shape.
+                let mut samples: Vec<Pos2> = ctx.input(|i| {
+                    i.events
+                        .iter()
+                        .filter_map(|e| match e {
+                            Event::PointerMoved(p) => Some(*p),
+                            _ => None,
+                        })
+                        .collect()
+                });
+                if samples.is_empty() {
+                    samples.extend(pointer);
+                }
+                for p in samples {
+                    self.continue_drag(p, mods);
+                }
+            } else if let Some(p) = pointer {
                 self.continue_drag(p, mods);
             }
         }
@@ -1630,6 +1949,25 @@ impl App {
                     Tool::Pen => CursorIcon::Crosshair,
                     Tool::Eraser => CursorIcon::None,
                     Tool::Note => CursorIcon::Text,
+                    Tool::Select if self.cropping.is_some() => {
+                        match hover.and_then(|p| self.hit_crop(p)) {
+                            Some(CropGrip::Edges {
+                                left,
+                                top,
+                                right,
+                                bottom,
+                            }) => match (left || right, top || bottom) {
+                                (true, true) if (left && top) || (right && bottom) => {
+                                    CursorIcon::ResizeNwSe
+                                }
+                                (true, true) => CursorIcon::ResizeNeSw,
+                                (true, false) => CursorIcon::ResizeHorizontal,
+                                _ => CursorIcon::ResizeVertical,
+                            },
+                            Some(CropGrip::Slide) => CursorIcon::Move,
+                            None => CursorIcon::Default,
+                        }
+                    }
                     Tool::Select => match hover.and_then(|p| self.hit_handle(p, mods)) {
                         Some(Handle::Scale(i)) => {
                             if i % 2 == 0 {
@@ -1655,7 +1993,10 @@ impl App {
             self.draw_grid(&painter, rect);
         }
         self.layout_notes(&painter);
-        for it in &self.items {
+        // Pen strokes always sit above images and notes.
+        let (strokes, others): (Vec<&Item>, Vec<&Item>) =
+            self.items.iter().partition(|it| it.is_stroke());
+        for it in others.into_iter().chain(strokes) {
             let aabb = it.world_aabb();
             let screen = Rect::from_two_pos(self.w2s(aabb.min), self.w2s(aabb.max));
             if screen.intersects(rect) {
@@ -1697,24 +2038,14 @@ impl App {
         let editing = self.editing == Some(it.id);
         match &it.content {
             Content::Image(a) => {
-                let mut mesh = Mesh::with_texture(a.texture.id());
-                let h = it.size * 0.5;
-                let corners = [
-                    (vec2(-h.x, -h.y), pos2(0.0, 0.0)),
-                    (vec2(h.x, -h.y), pos2(1.0, 0.0)),
-                    (vec2(h.x, h.y), pos2(1.0, 1.0)),
-                    (vec2(-h.x, h.y), pos2(0.0, 1.0)),
-                ];
-                for (l, uv) in corners {
-                    mesh.vertices.push(egui::epaint::Vertex {
-                        pos: self.w2s(it.local_to_world(l)),
-                        uv,
-                        color: Color32::WHITE,
-                    });
+                if self.cropping.as_ref().is_some_and(|c| c.id == it.id) {
+                    // Show the whole picture faded so the cropped-away parts stay visible.
+                    let c = it.crop_px(a.size).center();
+                    let full = Rect::from_min_size(Pos2::ZERO, a.size).translate(-c.to_vec2());
+                    self.paint_image(painter, it, a, FULL_CROP, full, Color32::WHITE.gamma_multiply(0.3));
                 }
-                mesh.add_triangle(0, 1, 2);
-                mesh.add_triangle(0, 2, 3);
-                painter.add(Shape::mesh(mesh));
+                let visible = Rect::from_center_size(Pos2::ZERO, it.size);
+                self.paint_image(painter, it, a, it.crop, visible, Color32::WHITE);
             }
             Content::Note(n) => {
                 // While editing, the note is shown upright so it lines up with the text editor.
@@ -1772,7 +2103,63 @@ impl App {
         }
     }
 
+    /// Paint part of an image: `uv` of the texture onto the `local` rect (unscaled, relative to
+    /// the item center).
+    fn paint_image(
+        &self,
+        painter: &egui::Painter,
+        it: &Item,
+        asset: &ImageAsset,
+        uv: Rect,
+        local: Rect,
+        tint: Color32,
+    ) {
+        let mut mesh = Mesh::with_texture(asset.texture.id());
+        for (l, uv) in [
+            (local.left_top(), uv.left_top()),
+            (local.right_top(), uv.right_top()),
+            (local.right_bottom(), uv.right_bottom()),
+            (local.left_bottom(), uv.left_bottom()),
+        ] {
+            mesh.vertices.push(egui::epaint::Vertex {
+                pos: self.w2s(it.local_to_world(l.to_vec2())),
+                uv,
+                color: tint,
+            });
+        }
+        mesh.add_triangle(0, 1, 2);
+        mesh.add_triangle(0, 2, 3);
+        painter.add(Shape::mesh(mesh));
+    }
+
+    fn draw_crop_frame(&self, painter: &egui::Painter) {
+        let Some((idx, full)) = self.crop_target() else {
+            return;
+        };
+        let it = &self.items[idx];
+        let r = it.crop_px(full);
+        let frame: Vec<Pos2> = [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom()]
+            .iter()
+            .map(|p| self.w2s(it.px_to_world(full, *p)))
+            .collect();
+        painter.add(Shape::closed_line(frame, Stroke::new(1.5, Color32::WHITE)));
+        for (p, grip) in self.crop_grips() {
+            let corner = matches!(
+                grip,
+                CropGrip::Edges { left, top, right, bottom } if (left || right) && (top || bottom)
+            );
+            let size = if corner { vec2(11.0, 11.0) } else { vec2(9.0, 9.0) };
+            let r = Rect::from_center_size(p, size);
+            painter.rect_filled(r, 0.0, Color32::from_gray(20));
+            painter.rect_stroke(r, 0.0, Stroke::new(1.5, Color32::WHITE), StrokeKind::Middle);
+        }
+    }
+
     fn draw_selection(&self, painter: &egui::Painter) {
+        if self.cropping.is_some() {
+            self.draw_crop_frame(painter);
+            return;
+        }
         let outline = Stroke::new(1.0, ACCENT);
         let mut count = 0;
         for it in self.selected() {
@@ -1816,7 +2203,11 @@ impl App {
                 }
             }
             Drag::Draw { points } => {
-                let pts = points.iter().map(|p| self.w2s(*p)).collect();
+                // Preview through the gap-filling spline so the live line is already smooth.
+                let pts = smooth::densify(points, 1.0 / self.zoom)
+                    .into_iter()
+                    .map(|p| self.w2s(p))
+                    .collect();
                 draw_polyline(painter, pts, self.pen_width, self.pen_color);
             }
             _ => {}
@@ -1891,6 +2282,21 @@ impl App {
                 self.delete_selected();
                 ui.close();
             }
+            if self.cropping.is_some() {
+                if ui.button("Finish crop\tEnter").clicked() {
+                    self.finish_crop();
+                    ui.close();
+                }
+            } else if ui
+                .add_enabled(
+                    self.single_selected_image().is_some(),
+                    egui::Button::new("Crop\tC"),
+                )
+                .clicked()
+            {
+                self.start_crop(ctx);
+                ui.close();
+            }
             ui.menu_button("Transform", |ui| {
                 if ui.button("Flip horizontal\tH").clicked() {
                     self.flip(true);
@@ -1898,6 +2304,10 @@ impl App {
                 }
                 if ui.button("Flip vertical\tShift+H").clicked() {
                     self.flip(false);
+                    ui.close();
+                }
+                if ui.button("Reset crop").clicked() {
+                    self.reset_crop();
                     ui.close();
                 }
                 if ui.button("Reset transform\tCtrl+T").clicked() {
@@ -2033,12 +2443,25 @@ impl App {
                             (Tool::Note, "Note", "Click to place a text note  (T)"),
                         ] {
                             if ui
-                                .selectable_label(self.tool == tool, label)
+                                .selectable_label(self.tool == tool && self.cropping.is_none(), label)
                                 .on_hover_text(tip)
                                 .clicked()
                             {
                                 self.set_tool(tool);
                             }
+                        }
+                        let can_crop =
+                            self.cropping.is_some() || self.single_selected_image().is_some();
+                        if ui
+                            .add_enabled(
+                                can_crop,
+                                egui::Button::selectable(self.cropping.is_some(), "Crop"),
+                            )
+                            .on_hover_text("Crop the selected image  (C)")
+                            .on_disabled_hover_text("Select a single image to crop it")
+                            .clicked()
+                        {
+                            self.toggle_crop(ctx);
                         }
                         ui.separator();
                         for c in INK_COLORS {
@@ -2063,6 +2486,21 @@ impl App {
                                     .logarithmic(true)
                                     .text("width"),
                             );
+                            if self.tool == Tool::Pen {
+                                ui.add(
+                                    egui::Slider::new(&mut self.smoothing, 0.0..=1.0)
+                                        .text("smooth")
+                                        .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
+                                        .custom_parser(|s| {
+                                            s.trim_end_matches('%').trim().parse::<f64>().ok().map(|v| v / 100.0)
+                                        }),
+                                )
+                                .on_hover_text(
+                                    "Jitter smoothing applied when you lift the pen.\n\
+                                     Strokes are always drawn as smooth curves through the mouse \
+                                     samples; 0% keeps every sample exactly.",
+                                );
+                            }
                         }
                         ui.separator();
                         for (i, (bg, _)) in NOTE_COLORS.iter().enumerate() {
@@ -2126,6 +2564,7 @@ impl App {
             ("Rotate", "Drag just outside a corner (Shift snaps 15°)"),
             ("Paste / Copy / Cut", "Ctrl+V / Ctrl+C / Ctrl+X"),
             ("Duplicate / Delete", "Ctrl+D / Del"),
+            ("Crop image", "C, drag the handles; Enter applies, Esc cancels"),
             ("Flip", "H horizontal, Shift+H vertical"),
             ("Reset transform", "Ctrl+T"),
             ("Arrange", "Ctrl+P"),
@@ -2216,6 +2655,10 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         while let Ok(msg) = self.rx.try_recv() {
             self.handle_msg(ctx, msg);
+        }
+        if self.cropping.is_some() && self.crop_target().is_none() {
+            // The image went away (deleted, undone) while it was being cropped.
+            self.cropping = None;
         }
         if ctx.input(|i| i.viewport().close_requested()) && self.dirty && !self.allow_close {
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);

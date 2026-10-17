@@ -40,6 +40,9 @@ pub struct SavedItem {
 pub enum SavedKind {
     Image {
         image: usize,
+        /// Visible region as normalized [min_x, min_y, max_x, max_y]; absent when uncropped.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        crop: Option<[f32; 4]>,
     },
     Note {
         text: String,

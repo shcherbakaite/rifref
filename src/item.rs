@@ -6,6 +6,11 @@ use eframe::egui::{pos2, vec2, Color32, Pos2, Rect, TextureHandle, Vec2};
 pub const NOTE_PAD: f32 = 10.0;
 pub const NOTE_DEFAULT_WIDTH: f32 = 260.0;
 pub const NOTE_DEFAULT_FONT: f32 = 18.0;
+/// Uncropped image, in normalized texture coordinates.
+pub const FULL_CROP: Rect = Rect {
+    min: Pos2 { x: 0.0, y: 0.0 },
+    max: Pos2 { x: 1.0, y: 1.0 },
+};
 
 /// A decoded image living on the GPU, plus its original encoded bytes for saving / copying.
 pub struct ImageAsset {
@@ -50,6 +55,8 @@ pub struct Item {
     pub flip_x: bool,
     pub flip_y: bool,
     pub selected: bool,
+    /// Visible part of an image, in normalized texture coordinates. Unused by other content.
+    pub crop: Rect,
 }
 
 pub fn rotate(v: Vec2, angle: f32) -> Vec2 {
@@ -69,6 +76,7 @@ impl Item {
             flip_x: false,
             flip_y: false,
             selected: false,
+            crop: FULL_CROP,
         }
     }
 
@@ -76,11 +84,50 @@ impl Item {
         matches!(self.content, Content::Note(_))
     }
 
+    pub fn is_stroke(&self) -> bool {
+        matches!(self.content, Content::Stroke(_))
+    }
+
     pub fn note_mut(&mut self) -> Option<&mut Note> {
         match &mut self.content {
             Content::Note(n) => Some(n),
             _ => None,
         }
+    }
+
+    /// Visible part of an image of source size `full`, in source pixels.
+    pub fn crop_px(&self, full: Vec2) -> Rect {
+        Rect::from_min_max(
+            pos2(self.crop.min.x * full.x, self.crop.min.y * full.y),
+            pos2(self.crop.max.x * full.x, self.crop.max.y * full.y),
+        )
+    }
+
+    /// Source pixel -> world position.
+    pub fn px_to_world(&self, full: Vec2, px: Pos2) -> Pos2 {
+        self.local_to_world(px - self.crop_px(full).center())
+    }
+
+    /// World position -> source pixel.
+    pub fn world_to_px(&self, full: Vec2, w: Pos2) -> Pos2 {
+        self.crop_px(full).center() + self.world_to_local(w)
+    }
+
+    /// Show region `px` (source pixels) of the image, starting from the state in `from`.
+    /// With `pin_content` the picture stays put on the board and the frame changes (dragging crop
+    /// edges); otherwise the frame stays put and the picture slides inside it.
+    pub fn set_crop_px(&mut self, from: &Item, full: Vec2, px: Rect, pin_content: bool) {
+        let old = from.crop_px(full);
+        self.center = if pin_content {
+            from.local_to_world(px.center() - old.center())
+        } else {
+            from.center
+        };
+        self.size = px.size();
+        self.crop = Rect::from_min_max(
+            pos2(px.min.x / full.x, px.min.y / full.y),
+            pos2(px.max.x / full.x, px.max.y / full.y),
+        );
     }
 
     /// Half extents in world units.
@@ -185,5 +232,52 @@ impl Frame {
     pub fn contains(&self, w: Pos2) -> bool {
         let l = rotate(w - self.center, -self.rotation);
         l.x.abs() <= self.half.x && l.y.abs() <= self.half.y
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn image_item() -> Item {
+        let mut it = Item::new(1, Content::Stroke(StrokeData {
+            points: Arc::new(vec![]),
+            color: Color32::WHITE,
+            width: 1.0,
+        }), pos2(100.0, 50.0), vec2(400.0, 200.0));
+        it.scale = 2.0;
+        it.rotation = 0.7;
+        it.flip_x = true;
+        it
+    }
+
+    #[test]
+    fn cropping_keeps_content_in_place() {
+        let full = vec2(400.0, 200.0);
+        let orig = image_item();
+        // A source pixel's world position must not change when the crop edges move.
+        let probe = pos2(250.0, 120.0);
+        let before = orig.px_to_world(full, probe);
+        let mut it = orig.clone();
+        it.set_crop_px(&orig, full, Rect::from_min_max(pos2(200.0, 100.0), pos2(380.0, 190.0)), true);
+        assert_eq!(it.size, vec2(180.0, 90.0));
+        assert!(it.px_to_world(full, probe).distance(before) < 1e-3);
+        assert!(it.world_to_px(full, before).distance(probe) < 1e-3);
+        // Uncropping again restores the original geometry.
+        let cropped = it.clone();
+        it.set_crop_px(&cropped, full, Rect::from_min_size(Pos2::ZERO, full), true);
+        assert!(it.center.distance(orig.center) < 1e-3);
+        assert_eq!(it.crop, FULL_CROP);
+    }
+
+    #[test]
+    fn sliding_keeps_frame_in_place() {
+        let full = vec2(400.0, 200.0);
+        let mut orig = image_item();
+        orig.set_crop_px(&orig.clone(), full, Rect::from_min_max(pos2(0.0, 0.0), pos2(200.0, 100.0)), true);
+        let mut it = orig.clone();
+        it.set_crop_px(&orig, full, Rect::from_min_max(pos2(100.0, 50.0), pos2(300.0, 150.0)), false);
+        assert_eq!(it.center, orig.center);
+        assert_eq!(it.size, orig.size);
     }
 }

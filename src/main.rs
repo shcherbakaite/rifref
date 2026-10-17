@@ -5,6 +5,7 @@ mod item;
 mod loader;
 mod pdf;
 mod scene;
+mod smooth;
 
 fn main() -> eframe::Result {
     let startup_file = std::env::args_os().nth(1).map(std::path::PathBuf::from);
