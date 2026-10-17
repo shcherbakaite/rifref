@@ -3007,6 +3007,13 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
             self.pending = Some(Pending::Close);
         }
+        // Only text fields may hold keyboard focus. Tab otherwise moves focus to a button or the
+        // canvas, and egui then reports the keyboard as busy, which disables every shortcut.
+        if let Some(id) = ctx.memory(|m| m.focused()) {
+            if egui::TextEdit::load_state(ctx, id).is_none() {
+                ctx.memory_mut(|m| m.surrender_focus(id));
+            }
+        }
         self.handle_dropped(ctx);
         self.handle_shortcuts(ctx);
 
