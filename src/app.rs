@@ -13,7 +13,7 @@ use eframe::egui::{
 
 use crate::item::{
     polyline_distance, rotate, segment_distance, stroke_geometry, Content,
-    Frame as SelFrame, ImageAsset, Item, Link, StrokeData, FULL_CROP,
+    Frame as SelFrame, ImageAsset, Item, Link, StrokeData, TitleBar, FULL_CROP,
 };
 use crate::loader::{self, Decoded, Layout, LoadMsg};
 use crate::pdf;
@@ -172,6 +172,14 @@ struct Snapshot {
     links: Vec<Link>,
 }
 
+/// The label colour palette opened from a title bar's colour square.
+struct TagPicker {
+    /// The card whose square was clicked.
+    id: u64,
+    /// Where the palette opens (screen).
+    at: Pos2,
+}
+
 /// An item title being typed in the inline editor.
 struct TitleEdit {
     id: u64,
@@ -225,6 +233,9 @@ pub struct App {
 
     cropping: Option<CropState>,
     title_edit: Option<TitleEdit>,
+    tag_picker: Option<TagPicker>,
+    /// Item under the pointer this frame (shows its title bar's colour square).
+    hovered: Option<u64>,
 
     background: Color32,
     grid: bool,
@@ -274,6 +285,8 @@ impl App {
             eraser_radius: 16.0,
             cropping: None,
             title_edit: None,
+            tag_picker: None,
+            hovered: None,
             background: BACKGROUNDS[0].1,
             grid: false,
             grid_size: DEFAULT_GRID,
@@ -1194,12 +1207,75 @@ impl App {
 
     /// Set the label colour of the selected images (`None`: default).
     fn set_tag(&mut self, tag: Option<Color32>) {
-        if !self.selected().any(|it| !it.is_stroke() && it.tag != tag) {
+        let ids: Vec<u64> = self.selected().filter(|it| !it.is_stroke()).map(|it| it.id).collect();
+        self.set_tag_of(&ids, tag);
+    }
+
+    fn set_tag_of(&mut self, ids: &[u64], tag: Option<Color32>) {
+        let hit = |it: &Item| ids.contains(&it.id) && !it.is_stroke();
+        if !self.items.iter().any(|it| hit(it) && it.tag != tag) {
             return;
         }
         self.push_undo();
-        for it in self.items.iter_mut().filter(|i| i.selected && !i.is_stroke()) {
+        for it in self.items.iter_mut().filter(|it| hit(it)) {
             it.tag = tag;
+        }
+    }
+
+    /// Image whose title bar colour square is under `w`.
+    fn hit_swatch(&self, w: Pos2) -> Option<usize> {
+        let i = self.hit_item(w)?;
+        let it = &self.items[i];
+        (!it.is_stroke() && it.title_bar()?.hit_swatch(w)).then_some(i)
+    }
+
+    /// The label palette for the card whose colour square was clicked. Colours every selected
+    /// image when that card is part of the selection, otherwise just the card.
+    fn tag_picker(&mut self, ctx: &egui::Context) {
+        let Some(picker) = &self.tag_picker else {
+            return;
+        };
+        let (id, at) = (picker.id, picker.at);
+        let Some(card) = self.item_by_id(id) else {
+            self.tag_picker = None;
+            return;
+        };
+        let ids: Vec<u64> = if card.selected {
+            self.selected().filter(|it| !it.is_stroke()).map(|it| it.id).collect()
+        } else {
+            vec![id]
+        };
+        let current = card.tag;
+        let mut chosen = None;
+        let resp = egui::Area::new(Id::new("tag-picker"))
+            .fixed_pos(at)
+            .order(Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        for c in TAG_COLORS {
+                            if swatch(ui, c, current == Some(c)).on_hover_text("Label colour").clicked() {
+                                chosen = Some(Some(c));
+                            }
+                        }
+                        if swatch(ui, Color32::TRANSPARENT, current.is_none())
+                            .on_hover_text("No label colour")
+                            .clicked()
+                        {
+                            chosen = Some(None);
+                        }
+                    });
+                });
+            });
+        let pressed_outside = ctx.input(|i| {
+            i.pointer.any_pressed()
+                && i.pointer.interact_pos().is_some_and(|p| !resp.response.rect.contains(p))
+        });
+        if let Some(tag) = chosen {
+            self.set_tag_of(&ids, tag);
+            self.tag_picker = None;
+        } else if pressed_outside || ctx.input(|i| i.key_pressed(Key::Escape)) {
+            self.tag_picker = None;
         }
     }
 
@@ -2101,6 +2177,14 @@ impl App {
             }
             self.finish_crop();
         }
+        if self.tool == Tool::Select {
+            if let Some(i) = self.hit_swatch(w) {
+                let (c, q) = self.items[i].title_bar().and_then(|b| b.swatch()).unwrap();
+                let at = self.w2s(c) + vec2(-q * self.zoom, q * self.zoom + 4.0);
+                self.tag_picker = Some(TagPicker { id: self.items[i].id, at });
+                return;
+            }
+        }
         match self.tool {
             // Links are selected by clicking them, with the Select or the Link tool.
             Tool::Select | Tool::Link if self.hit_link_on_top(w).is_some() => {
@@ -2142,6 +2226,9 @@ impl App {
     fn double_click(&mut self, w: Pos2) {
         if self.cropping.is_some() {
             self.finish_crop();
+            return;
+        }
+        if self.hit_swatch(w).is_some() {
             return;
         }
         match self.hit_item(w) {
@@ -2302,6 +2389,9 @@ impl App {
                             }
                         }
                         Some(Handle::Rotate) => CursorIcon::Alias,
+                        None if hover.is_some_and(|p| self.hit_swatch(self.s2w(p)).is_some()) => {
+                            CursorIcon::PointingHand
+                        }
                         None => match hover.and_then(|p| self.hit_item(self.s2w(p))) {
                             Some(i) if self.items[i].selected => CursorIcon::Move,
                             Some(_) => CursorIcon::PointingHand,
@@ -2317,6 +2407,10 @@ impl App {
         if self.grid {
             self.draw_grid(&painter, rect);
         }
+        self.hovered = hover
+            .filter(|p| rect.contains(*p))
+            .and_then(|p| self.hit_item(self.s2w(p)))
+            .map(|i| self.items[i].id);
         // Layers: images, then links between them, then pen strokes on top.
         let (strokes, others): (Vec<&Item>, Vec<&Item>) =
             self.items.iter().partition(|it| it.is_stroke());
@@ -2414,7 +2508,7 @@ impl App {
             TextFormat::simple(FontId::proportional(size), ink),
         );
         job.wrap = TextWrapping {
-            max_width: ((bar.length - pad * 2.0) * self.zoom).max(1.0),
+            max_width: (bar.text_length(pad) * self.zoom).max(1.0),
             max_rows: 1,
             break_anywhere: true,
             overflow_character: Some('…'),
@@ -2423,6 +2517,26 @@ impl App {
         let text_h = galley.size().y / self.zoom;
         let top_left = bar.origin + bar.along * pad - bar.up * ((bar.height - text_h) * 0.5);
         painter.add(TextShape::new(self.w2s(top_left), galley, ink).with_angle(bar.along.angle()));
+        self.draw_swatch(painter, it, &bar);
+    }
+
+    /// The colour square on a selected or hovered card's title bar.
+    fn draw_swatch(&self, painter: &egui::Painter, it: &Item, bar: &TitleBar) {
+        let show = it.selected
+            || self.hovered == Some(it.id)
+            || self.tag_picker.as_ref().is_some_and(|p| p.id == it.id);
+        let Some((c, q)) = bar.swatch().filter(|_| show && self.tool == Tool::Select) else {
+            return;
+        };
+        // A tiny four-colour palette, so it reads as "pick a colour" on any bar colour.
+        let corner = |a: f32, u: f32| self.w2s(c + bar.along * (a * q) + bar.up * (u * q));
+        let quads = [(-1.0, 1.0, 1), (0.0, 1.0, 3), (-1.0, 0.0, 4), (0.0, 0.0, 6)];
+        for (a, u, k) in quads {
+            let cell = vec![corner(a, u), corner(a + 1.0, u), corner(a + 1.0, u - 1.0), corner(a, u - 1.0)];
+            painter.add(Shape::convex_polygon(cell, TAG_COLORS[k], Stroke::NONE));
+        }
+        let square = vec![corner(-1.0, 1.0), corner(1.0, 1.0), corner(1.0, -1.0), corner(-1.0, -1.0)];
+        painter.add(Shape::closed_line(square, Stroke::new(1.5, Color32::WHITE)));
     }
 
     fn draw_links(&self, painter: &egui::Painter) {
@@ -2997,7 +3111,8 @@ impl App {
             ("Import images / PDF pages", "Ctrl+I (or drag & drop)"),
             ("Always on top", "Ctrl+Shift+T"),
             ("Grid", "G show · N / Shift+N spacing · hold Shift while dragging to snap"),
-            ("Title an image", "T or F2, or double-click its title bar · right-click → Label colour"),
+            ("Title an image", "T or F2, or double-click its title bar"),
+            ("Label colour", "Click the colour square on a title bar (or right-click → Label colour)"),
             ("Link items", "L, then drag from a spot on one item to a spot on another"),
             ("Move a pin", "Drag a link's pin to another spot, or onto another item · Del removes a selected link"),
             ("Snap while moving", "Shift: a stroke's points (or an image's corner) land on the grid"),
@@ -3112,6 +3227,7 @@ impl eframe::App for App {
         self.pdf_dialog(ctx);
         self.hud(ctx);
         self.title_editor(ctx);
+        self.tag_picker(ctx);
         if self.show_help {
             self.help_window(ctx);
         }

@@ -28,7 +28,7 @@ them, sketch over them, and connect them with titled cards and links like an inv
   - Stroke width is in board pixels, so strokes stay in proportion to the images at any zoom.
   - The eraser splits strokes where it passes.
 - **Titles and labels.** Give an image a caption bar (T, F2, or double-click the bar) and a label
-  colour to group related cards. The bar goes on whichever edge is on top when you first add the
+  colour to group related cards; the colour square on the bar opens the palette. The bar goes on whichever edge is on top when you first add the
   title, then stays on that edge through rotation and flips, with the text never mirrored.
 - **Pinned links.** With the Link tool (L), drag from a spot on one item to a spot on another to
   stretch a string between two pins.
@@ -90,7 +90,8 @@ Press **F1** in the app to see the same list.
 | Duplicate / Delete | Ctrl+D / Del |
 | Crop image | C, drag the handles; Enter applies, Esc cancels |
 | Title an image | T or F2, or double-click its title bar |
-| Label colour, link direction and arrowheads | Right-click menu |
+| Label colour | Click the colour square on a selected or hovered title bar |
+| Link direction and arrowheads | Right-click menu |
 | Flip | H horizontal, Shift+H vertical |
 | Reset transform | Ctrl+T |
 | Arrange | Ctrl+P |

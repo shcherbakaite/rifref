@@ -75,6 +75,31 @@ impl TitleBar {
         [self.origin, self.origin + end, self.origin + end + inner, self.origin + inner]
     }
 
+    /// The colour square at the end of the bar: center and half side. `None` when the bar is
+    /// too short to fit it next to some text.
+    pub fn swatch(&self) -> Option<(Pos2, f32)> {
+        (self.length >= self.height * 3.0).then(|| {
+            let c = self.origin + self.along * (self.length - self.height * 0.5)
+                - self.up * (self.height * 0.5);
+            (c, self.height * 0.3)
+        })
+    }
+
+    pub fn hit_swatch(&self, w: Pos2) -> bool {
+        self.swatch().is_some_and(|(c, q)| {
+            let r = w - c;
+            // A little extra margin: the square is small.
+            let q = q * 1.4;
+            r.dot(self.along).abs() <= q && r.dot(self.up).abs() <= q
+        })
+    }
+
+    /// Room the text may use, leaving space for the colour square.
+    pub fn text_length(&self, pad: f32) -> f32 {
+        let swatch = if self.swatch().is_some() { self.height } else { 0.0 };
+        self.length - pad * 2.0 - swatch
+    }
+
     pub fn contains(&self, w: Pos2) -> bool {
         let r = w - self.origin;
         let (a, u) = (r.dot(self.along), r.dot(self.up));
@@ -434,6 +459,10 @@ mod tests {
         assert!((bar.up - vec2(1.0, 0.0)).length() < 1e-5);
         assert!((bar.along - vec2(0.0, 1.0)).length() < 1e-5);
         assert!(it.hit_title(pos2(100.0 + bar.height * 0.5, 0.0)));
+        // The colour square sits at the end of the bar, here its bottom.
+        let (c, _) = bar.swatch().unwrap();
+        assert!(c.distance(pos2(100.0 + bar.height * 0.5, 50.0 - bar.height * 0.5)) < 1e-3);
+        assert!(bar.hit_swatch(c) && !bar.hit_swatch(pos2(100.0 + bar.height * 0.5, 0.0)));
     }
 
     #[test]
